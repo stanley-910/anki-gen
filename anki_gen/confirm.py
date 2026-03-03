@@ -131,6 +131,11 @@ def _read_key() -> str:
     if not select.select([sys.stdin], [], [], 0.05)[0]:
         return "\x1b"
     ch2 = sys.stdin.read(1)
+    if ch2 == "O":
+        if not select.select([sys.stdin], [], [], 0.05)[0]:
+            return "\x1bO"
+        ch3 = sys.stdin.read(1)
+        return "\x1bO" + ch3
     if ch2 != "[":
         return "\x1b" + ch2
     seq = ""
@@ -458,11 +463,11 @@ def review_concepts(
                 else:
                     tot = _total()
 
-                    if key in ("j", "\x1b[B"):  # down (wrap)
+                    if key in ("j", "\x1b[B", "\x1bOB"):  # down (wrap)
                         if tot > 0:
                             cursor = (cursor + 1) % tot
 
-                    elif key in ("k", "\x1b[A"):  # up (wrap)
+                    elif key in ("k", "\x1b[A", "\x1bOA"):  # up (wrap)
                         if tot > 0:
                             cursor = (cursor - 1) % tot
 
