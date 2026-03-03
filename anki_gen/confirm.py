@@ -16,6 +16,7 @@ Public API: review_concepts(title, concepts)
     - notes:              non-deleted note strings (general LLM instructions)
 """
 
+import os
 import select
 import shutil
 import sys
@@ -120,29 +121,43 @@ def _raw_mode():
 
 
 def _read_key() -> str:
-    """Read one logical keypress, including multi-byte escape sequences."""
+    """
+    Read one logical keypress, including multi-byte escape sequences.
+
+    Uses os.read() on the raw file descriptor instead of sys.stdin.read() to
+    bypass Python's TextIOWrapper buffer.  The buffered reader can drain the
+    entire escape sequence (e.g. b'\\x1b[A') into its internal cache on the
+    first read(1) call, leaving the OS fd empty so the subsequent
+    select.select() returns False and the sequence is misidentified as a bare
+    ESC.  os.read() reads exactly the bytes present without pre-buffering.
+    """
+    fd = sys.stdin.fileno()
+
+    def _readb() -> str:
+        return os.read(fd, 1).decode("utf-8", errors="replace")
+
     try:
-        ch = sys.stdin.read(1)
-    except KeyboardInterrupt:
+        ch = _readb()
+    except (OSError, KeyboardInterrupt):
         return "\x03"
     if ch != "\x1b":
         return ch
     # Peek for the rest of an escape sequence with a short timeout
-    if not select.select([sys.stdin], [], [], 0.05)[0]:
+    if not select.select([fd], [], [], 0.05)[0]:
         return "\x1b"
-    ch2 = sys.stdin.read(1)
+    ch2 = _readb()
     if ch2 == "O":
-        if not select.select([sys.stdin], [], [], 0.05)[0]:
+        if not select.select([fd], [], [], 0.05)[0]:
             return "\x1bO"
-        ch3 = sys.stdin.read(1)
+        ch3 = _readb()
         return "\x1bO" + ch3
     if ch2 != "[":
         return "\x1b" + ch2
     seq = ""
     while True:
-        if not select.select([sys.stdin], [], [], 0.05)[0]:
+        if not select.select([fd], [], [], 0.05)[0]:
             break
-        c = sys.stdin.read(1)
+        c = _readb()
         seq += c
         if c.isalpha() or c == "~":
             break
