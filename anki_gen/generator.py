@@ -200,8 +200,7 @@ _CARDS_FROM_CONCEPTS_TEMPLATE = """\
 You are an expert educator creating Anki flashcards from study notes.
 
 ## Task
-Generate exactly ONE flashcard for each of the {num_concepts} confirmed concepts below.
-The output array must contain exactly {num_concepts} cards — one per concept, no more.
+{task_count_instruction}
 
 Confirmed concepts:
 {concept_list}
@@ -232,7 +231,7 @@ Rules:
 - {code_instruction}
 - {srs_instruction}
 {notes_section}## Output format
-Return ONLY a JSON array of exactly {num_concepts} elements. No prose before or after.
+Return ONLY a JSON array{output_count_instruction}. No prose before or after.
 Each element is one of:
 
   {{"type": "basic", "front": "<question>", "back": "<answer>"}}
@@ -507,14 +506,15 @@ def generate_cards_from_concepts(
     Phase 2 — generate exactly one card per confirmed concept.
 
     The prompt instructs the LLM to produce one card per concept and to choose
-    the best card type (basic vs definition) for each. The output is capped at
-    len(concepts) as a hard safety net, then MathJax notation is enforced.
+    the best card type (basic vs definition) for each. When no notes are
+    present the output is capped at len(concepts) as a hard safety net; when
+    notes are present the cap is lifted so notes can request extra cards.
 
     *notes* is an optional list of free-text instructions that the user entered
     in the confirm TUI (via the 'n' key).  When provided they are injected into
     the prompt as an "Additional instructions" section so the LLM can apply
     them while building cards (e.g. "make cards testable forwards and backwards"
-    or "focus only on the equations").
+    or "focus only on the equations" or "also add a card for X").
 
     *reversed_concepts* is an optional set of concept strings that the user
     explicitly marked for reversal in the TUI (via the 'r' / 'R' keys). These
@@ -522,10 +522,28 @@ def generate_cards_from_concepts(
     """
     concept_list = _format_concept_list(concepts, reversed_concepts)
     num_concepts = len(concepts)
+    has_notes = bool(notes)
+
+    if has_notes:
+        task_count_instruction = (
+            f"Generate ONE flashcard for each of the {num_concepts} confirmed"
+            f" concepts below, plus any additional cards requested in the"
+            f" 'Additional instructions' section."
+        )
+        output_count_instruction = f" with at least {num_concepts} elements"
+    else:
+        task_count_instruction = (
+            f"Generate exactly ONE flashcard for each of the {num_concepts}"
+            f" confirmed concepts below.\n"
+            f"The output array must contain exactly {num_concepts} cards"
+            f" — one per concept, no more."
+        )
+        output_count_instruction = f" of exactly {num_concepts} elements"
 
     prompt = _CARDS_FROM_CONCEPTS_TEMPLATE.format(
         concept_list=concept_list,
-        num_concepts=num_concepts,
+        task_count_instruction=task_count_instruction,
+        output_count_instruction=output_count_instruction,
         mathjax_instruction=_MATHJAX_INSTRUCTION,
         code_instruction=_CODE_INSTRUCTION,
         srs_instruction=_SRS_INSTRUCTION,
@@ -536,8 +554,11 @@ def generate_cards_from_concepts(
 
     raw = provider.complete(prompt)
     cards = _parse_cards(_extract_json_array(raw))
-    # Hard cap: never return more cards than there are concepts
-    cards = cards[:num_concepts]
+    # When no notes: hard cap at num_concepts as a safety net against
+    # over-generation. When notes are present: lift the cap so the model can
+    # add extra cards requested by the user's instructions.
+    if not has_notes:
+        cards = cards[:num_concepts]
     return _apply_mathjax(cards)
 
 
