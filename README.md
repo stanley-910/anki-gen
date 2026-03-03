@@ -4,6 +4,14 @@ Generate Anki flashcards from Markdown notes using an LLM.
 
 Local model support soon. Currently supports API usage for OpenAI and Anthropic
 
+## Demo
+
+
+
+https://github.com/user-attachments/assets/ff8395ee-8c3b-44c2-9018-66d6a6d63117
+
+
+
 ## Features
 
 - Parses `.md` files and generates flashcards via OpenAI or Anthropic
