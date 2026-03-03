@@ -531,6 +531,13 @@ def main() -> None:
                 print(f"warning: Failed to parse {md_path}: {exc}", file=sys.stderr)
                 continue
 
+            if not doc.plain_text.strip():
+                print(
+                    f"warning: {md_path.name} has no content, skipping.",
+                    file=sys.stderr,
+                )
+                continue
+
             deck_name = args.deck or doc.title
 
             if args.confirm:

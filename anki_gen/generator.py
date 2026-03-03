@@ -227,6 +227,9 @@ Rules:
 - Cover every concept in the list — do not skip any.
 - Concepts marked [REVERSED] MUST use the "basic_reversed" type — no other type is allowed for them.
 - Each card must be self-contained (no pronouns requiring outside context).
+- CRITICAL: every piece of information on every card must come directly and
+  exclusively from the source notes below. Do NOT add facts, definitions,
+  explanations, or context that are not explicitly stated in the source.
 - {mathjax_instruction}
 - {code_instruction}
 - {srs_instruction}
@@ -269,6 +272,11 @@ Produce a mix of:
 Prioritise the most important concepts, relationships, and facts.
 Do NOT generate cards for trivial or obvious statements.
 Each card must be self-contained — no pronouns that require context to resolve.
+CRITICAL: every piece of information on every card must come directly and
+exclusively from the source notes below. Do NOT add facts, definitions,
+explanations, or context that are not explicitly stated in the source.
+If the source notes are empty or contain no substantive content, return an
+empty JSON array: [].
 - {mathjax_instruction}
 - {code_instruction}
 - {srs_instruction}

@@ -16,7 +16,9 @@ Public API: review_concepts(title, concepts)
     - notes:              non-deleted note strings (general LLM instructions)
 """
 
+import math
 import os
+import re
 import select
 import shutil
 import sys
@@ -185,9 +187,25 @@ class _Item:
 # Rendering
 # ---------------------------------------------------------------------------
 
+# Matches any ANSI/VT escape sequence (CSI sequences cover all color/style
+# codes; the second branch catches other two-byte Esc sequences).
+_ANSI_ESC_RE = re.compile(r"\x1b\[[^\x40-\x7e]*[\x40-\x7e]|\x1b.")
+
 
 def _term_width() -> int:
     return shutil.get_terminal_size((80, 24)).columns
+
+
+def _visible_len(s: str) -> int:
+    """Visible character count after stripping ANSI escape sequences."""
+    return len(_ANSI_ESC_RE.sub("", s))
+
+
+def _physical_rows(visible_len: int, w: int) -> int:
+    """Terminal rows a rendered line occupies given terminal width *w*."""
+    if w <= 0 or visible_len == 0:
+        return 1
+    return math.ceil(visible_len / w)
 
 
 def _render_item(
@@ -324,7 +342,9 @@ def _draw(
 
     sys.stdout.write("".join(out))
     sys.stdout.flush()
-    return len(lines)
+    # Return physical rows (not logical lines) so the next call's cursor-up
+    # travels back exactly the right distance even when lines wrap.
+    return sum(_physical_rows(_visible_len(line), w) for line in lines)
 
 
 def _erase(total_lines: int) -> None:
