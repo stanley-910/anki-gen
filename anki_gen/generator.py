@@ -42,6 +42,17 @@ Every piece of code must be explicitly marked — no exceptions:
     ```
   - Complex inline examples (e.g. a full `if let` expression) must also use a
     fenced block rather than being embedded in a sentence.
+  - When a code block contains a diagram, ASCII art, or any indented structure,
+    reproduce every character exactly — including ALL leading spaces on the VERY
+    FIRST line. Do NOT trim or normalise the first line or any other line.
+    Example: if the source has
+    ```
+           G - H    lanes_branch
+          /
+    A - B - C - D   main
+    ```
+    the card MUST preserve the 7 spaces before "G" on the first line, exactly
+    as they appear. Stripping them breaks the visual alignment of the diagram.
 Do NOT write raw HTML tags (<pre>, <code>, <span>, etc.) in any field.\
 """
 
@@ -53,7 +64,12 @@ Optimise every card for spaced-repetition (SRS):
   - If the source expresses a concept as a list of bullets, the card field may
     (and should) preserve that structure as an HTML list:
       <ul><li>first point</li><li>second point</li></ul>
-  - Add context only when the source is genuinely ambiguous without it.\
+  - Add context only when the source is genuinely ambiguous without it.
+  - CRITICAL: preserve ALL emphasis from the source — bold (**word**) and
+    italic (*word*) MUST be reproduced using the exact same markdown syntax
+    (**…** for bold, *…* for italic). NEVER strip, flatten, or ignore emphasis.
+    If the source bolds a term, the card MUST bold it. If the source italicises
+    a phrase, the card MUST italicise it. Dropping emphasis is a content error.\
 """
 
 # ---------------------------------------------------------------------------
@@ -63,17 +79,28 @@ Optimise every card for spaced-repetition (SRS):
 # Compiled once at module level for performance.
 _FENCED_RE = re.compile(r"```([^\n]*)\n([\s\S]*?)```")
 
-# Matches patterns that _render_inline_segment should preserve rather than
-# html-escape:
-#   1. Inline backtick code  →  wrapped in <code>…</code>
-#   2. <img> tags            →  verbatim (hook for future image support)
-#   3. Whitelisted HTML structural/formatting tags  →  verbatim, so that
+# Matches patterns that _render_inline_segment should handle specially rather
+# than passing raw to html.escape():
+#   1. Inline backtick code   →  wrapped in <code>…</code>
+#   2. Markdown **bold**      →  <strong>…</strong>
+#   3. Markdown *italic*      →  <em>…</em>
+#      Note: __ and _ variants are intentionally excluded — `_` is too common
+#      in code identifiers (e.g. __init__) to be a safe italic delimiter.
+#      Bold must come before italic in the alternation so that ** is not
+#      consumed by two successive * matches.
+#   4. <img> tags             →  verbatim (hook for future image support)
+#   5. Whitelisted HTML structural/formatting tags  →  verbatim, so that
 #      LLM-generated <ul><li>…</li></ul> lists and <pre><code>…</code></pre>
 #      blocks reach Anki as real HTML instead of escaped literal text.
 #      The *content* between matched tag boundaries still flows through
 #      html.escape(), so code with <, >, & is handled correctly.
+#
+# Named groups are used so that the dispatch in _render_inline_segment can
+# identify which alternative matched without re-examining the raw string.
 _COMBINED_INLINE_RE = re.compile(
-    r"`([^`\n]+)`"
+    r"`(?P<backtick>[^`\n]+)`"
+    r"|\*\*(?P<bold>[^*\n]+)\*\*"
+    r"|\*(?P<em>[^*\n]+)\*"
     r"|<img\b[^>]*?/?>"
     r"|</?(?:ul|ol|li|br|p|pre|code|strong|em|b|i|h[1-6]|hr)\b[^>]*?/?>",
     re.IGNORECASE,
@@ -81,30 +108,69 @@ _COMBINED_INLINE_RE = re.compile(
 
 
 def _render_fenced(lang: str, code: str) -> str:
-    """Wrap a fenced code block in <pre><code> with HTML-escaped content."""
-    escaped = html.escape(code.rstrip("\n"))
+    """Wrap a fenced code block in <pre><code> with HTML-escaped content.
+
+    The opening <code> and closing </code> tags are placed on their own lines
+    so that the first line of content (including any leading spaces) is never
+    run together with the tag.  This is important for ASCII-art diagrams where
+    leading whitespace on the first line is visually significant.
+    """
+    escaped = html.escape(code.strip("\n"))
     tag = f' class="language-{html.escape(lang)}"' if lang else ""
-    return f"<pre><code{tag}>{escaped}</code></pre>"
+    return f"<pre><code{tag}>\n{escaped}\n</code></pre>"
 
 
 def _render_inline_segment(text: str) -> str:
     """
     Process a non-fenced text segment:
-    1. Inline backtick code  → <code>
-    2. <img …> tags          → preserved as-is (for image-support feature)
-    3. Everything else       → html.escape()
+    1. Inline backtick code  → <code> (content is html.escape()-d)
+    2. Markdown **bold**     → <strong> (content is html.escape()-d)
+    3. Markdown *italic*     → <em> (content is html.escape()-d)
+    4. <img …> tags          → preserved as-is (for image-support feature)
+    5. Whitelisted HTML tags → preserved verbatim
+    6. Text inside LLM-generated <code>…</code> → preserved verbatim
+       (it is already HTML-escaped by the LLM; re-escaping would double-encode
+       entities like &lt; → &amp;lt;)
+    7. Everything else       → html.escape()
+
+    A ``code_depth`` counter tracks nesting inside LLM-generated <code> blocks.
+    When depth > 0, plain-text segments between regex matches are emitted
+    verbatim instead of being passed through html.escape().
     """
     result: list[str] = []
     last = 0
+    code_depth = 0
     for m in _COMBINED_INLINE_RE.finditer(text):
-        result.append(html.escape(text[last : m.start()]))
+        before = text[last : m.start()]
+        if before:
+            result.append(before if code_depth > 0 else html.escape(before))
         raw = m.group(0)
-        if raw.startswith("`"):
-            result.append(f"<code>{html.escape(m.group(1))}</code>")
+        raw_lower = raw.lower()
+        if m.group("backtick") is not None:
+            # Markdown inline code: escape the content ourselves.
+            result.append(f"<code>{html.escape(m.group('backtick'))}</code>")
+        elif m.group("bold") is not None:
+            # Markdown **bold**: escape the content, wrap in <strong>.
+            result.append(f"<strong>{html.escape(m.group('bold'))}</strong>")
+        elif m.group("em") is not None:
+            # Markdown *italic*: escape the content, wrap in <em>.
+            result.append(f"<em>{html.escape(m.group('em'))}</em>")
+        elif raw_lower.startswith("<code"):
+            # Opening <code> or <code class="…"> from LLM-generated HTML.
+            code_depth += 1
+            result.append(raw)
+        elif raw_lower.startswith("</code"):
+            # Closing </code> from LLM-generated HTML.
+            code_depth = max(0, code_depth - 1)
+            result.append(raw)
         else:
-            result.append(raw)  # preserve <img> verbatim
+            result.append(
+                raw
+            )  # <img>, <ul>, <li>, <strong>, <em>, etc. — preserve verbatim
         last = m.end()
-    result.append(html.escape(text[last:]))
+    tail = text[last:]
+    if tail:
+        result.append(tail if code_depth > 0 else html.escape(tail))
     return "".join(result)
 
 
@@ -230,6 +296,11 @@ Rules:
 - CRITICAL: every piece of information on every card must come directly and
   exclusively from the source notes below. Do NOT add facts, definitions,
   explanations, or context that are not explicitly stated in the source.
+- CRITICAL: if a concept description contains explicit layout instructions
+  (e.g. "put the diagram on the front", "include X on the front of the card"),
+  follow them exactly. The "front" field may contain a diagram, code block, or
+  other context material before or after the question — it is not restricted to
+  a single question sentence.
 - {mathjax_instruction}
 - {code_instruction}
 - {srs_instruction}

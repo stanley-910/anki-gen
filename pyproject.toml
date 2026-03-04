@@ -21,5 +21,11 @@ dependencies = [
 anki-gen = "anki_gen.cli:main"
 anki-gen-mcp = "anki_gen.mcp_server:main"
 
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["anki_gen"]
