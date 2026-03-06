@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import sys
 from typing import TYPE_CHECKING
 
 from anki_gen.latex import convert_latex_to_mathjax
@@ -13,8 +14,73 @@ if TYPE_CHECKING:
     from anki_gen.llm.base import LLMProvider
 
 # ---------------------------------------------------------------------------
-# Shared prompt fragments
+# Context-window budget estimation
 # ---------------------------------------------------------------------------
+
+# Known input-token limits keyed by lowercase substrings of provider.name.
+# First matching key wins; "_default" is the fallback.
+_CONTEXT_LIMITS: dict[str, int] = {
+    "gpt-3.5": 16_385,
+    "gpt-4o-mini": 128_000,
+    "gpt-4o": 128_000,
+    "gpt-4-turbo": 128_000,
+    "gpt-4": 8_192,
+    "claude": 200_000,
+    "_default": 128_000,
+}
+
+# Warn when estimated prompt tokens exceed this fraction of the context window.
+_CONTEXT_WARN_THRESHOLD = 0.75
+
+# Maximum number of concepts sent to the LLM in a single Phase 2 call.
+# Keeping batches small ensures the model stays focused and follows per-card
+# instructions (e.g. the reverse-card rule) reliably across the whole deck.
+CHUNK_SIZE = 20
+
+# Shared signal written by _check_context_budget and read by the CLI animation
+# loop to drive the context-fill progress bar.  Index 0 holds the most recent
+# prompt-to-context-window ratio (0.0–1.0).  Plain list so writes are atomic
+# under the GIL; safe for the single-background-thread CLI usage pattern.
+_CTX_RATIO_SIGNAL: list[float] = [0.0]
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~4 characters per token (works for English prose)."""
+    return max(1, len(text) // 4)
+
+
+def _context_limit_for(provider_name: str) -> int:
+    """Return the input context-token limit for a provider/model name string."""
+    lower = provider_name.lower()
+    for key, limit in _CONTEXT_LIMITS.items():
+        if key == "_default":
+            continue
+        if key in lower:
+            return limit
+    return _CONTEXT_LIMITS["_default"]
+
+
+def _check_context_budget(prompt: str, provider: "LLMProvider") -> None:
+    """Update the shared context-ratio signal and warn when usage is high.
+
+    Always writes to ``_CTX_RATIO_SIGNAL`` so the CLI animation bar reflects
+    the actual context % regardless of whether the threshold is exceeded.
+    Does not raise — generation proceeds either way.
+    """
+    estimated = _estimate_tokens(prompt)
+    limit = _context_limit_for(provider.name)
+    ratio = estimated / limit
+    _CTX_RATIO_SIGNAL[0] = ratio
+    if ratio >= _CONTEXT_WARN_THRESHOLD:
+        pct = int(ratio * 100)
+        print(
+            f"[anki-gen] WARNING: prompt is ~{estimated:,} tokens"
+            f" ({pct}% of {provider.name}'s ~{limit:,}-token context window).\n"
+            "          Card quality may degrade. Consider splitting your notes"
+            " into smaller files or using --confirm with fewer concepts.",
+            file=sys.stderr,
+        )
+
 
 _MATHJAX_INSTRUCTION = """\
 For any mathematical notation use Anki's MathJax format exclusively.
@@ -244,6 +310,7 @@ def extract_concepts(
         title=doc.title,
         content=doc.plain_text,
     )
+    _check_context_budget(prompt, provider)
     raw = provider.complete(prompt)
     clean = _extract_json_array(raw)
     try:
@@ -276,22 +343,26 @@ For each concept choose the most appropriate card type:
   a specific meaning worth memorising directly.
 - Use "basic" for processes, relationships, reasons, comparisons, or anything
   better expressed as a question and answer.
-- Use "basic_reversed" when the additional instructions ask for bidirectional
-  testing, or when the relationship is inherently symmetric (e.g. a named
-  formula, a term with a symbol, a concept with a specific expression).
-  CRITICAL: both "front" and "back" must be phrased as questions or active
-  prompts — NOT as a statement and its answer. Anki will show each field
-  alone as the question in separate review sessions, so each side must
-  hide what the other reveals.
-  Good: front = "What is the closed-form solution for linear regression?",
-        back  = "What technique uses the formula \\\\( \\\\theta = (X^TX)^{{-1}}X^Ty \\\\)?"
-  Bad:  front = "The closed-form solution for linear regression is...",
-        back  = "\\\\( \\\\theta = (X^TX)^{{-1}}X^Ty \\\\)"
+- Use "basic_reversed" when a concept has two genuinely distinct testable
+  directions (e.g. name↔formula, cause↔effect, term↔mechanism). A concept
+  marked [REVERSED] should use "basic_reversed" — but only when a valid
+  reversal exists. If the concept is a bare fact, isolated property, or
+  inherently one-directional (e.g. "resting potential is -70 mV"), use "basic"
+  instead. A forced reversal that paraphrases the front is worse than no reversal.
+  Reversed card rule: "front" is the forward question; "back" is the reverse
+  question whose answer is the content of "front". Both sides must be standalone
+  questions testing different facts — answering "front" and "back" must give
+  different answers.
+  Good: front = "What technique uses \\\\( \\\\theta = (X^TX)^{{-1}}X^Ty \\\\)?",
+        back  = "What is the closed-form solution for linear regression?"
+        front answer = normal equation / linear regression; back answer = the formula ✓
+  Bad:  front = "Toward what potential does the membrane return during repolarization?",
+        back  = "What does the membrane potential return toward during the repolarization phase?"
+        → both answers = EK / -90 mV — paraphrase, not a reversal ✗
 
 Rules:
 - Exactly one card per concept — do NOT generate multiple cards for the same concept.
 - Cover every concept in the list — do not skip any.
-- Concepts marked [REVERSED] MUST use the "basic_reversed" type — no other type is allowed for them.
 - Each card must be self-contained (no pronouns requiring outside context).
 - CRITICAL: every piece of information on every card must come directly and
   exclusively from the source notes below. Do NOT add facts, definitions,
@@ -329,15 +400,20 @@ You are an expert educator creating Anki flashcards from study notes.
 Analyse the notes below and generate up to {max_cards} high-quality flashcards.
 Produce a mix of:
 - **basic** cards: a question on the front, a concise answer on the back.
-- **basic_reversed** cards: use when the relationship is inherently symmetric
-  (e.g. a named formula, a term with a symbol). CRITICAL: both "front" and
-  "back" must be phrased as questions or active prompts — NOT a statement and
-  its answer. Anki shows each field alone as the question in separate sessions,
-  so each side must hide what the other reveals.
-  Good: front = "What is the closed-form solution for linear regression?",
-        back  = "What technique uses θ = (XᵀX)⁻¹Xᵀy?"
-  Bad:  front = "The closed-form solution for linear regression is...",
-        back  = "θ = (XᵀX)⁻¹Xᵀy"
+- **basic_reversed** cards: use when a concept has two genuinely distinct
+  testable directions (e.g. name↔formula, cause↔effect, term↔mechanism).
+  Only use when a valid reversal exists — if the concept is a bare fact or
+  inherently one-directional, use "basic" instead.
+  Reversed card rule: "front" is the forward question; "back" is the reverse
+  question whose answer is the content of "front". Both sides must be standalone
+  questions testing different facts — answering "front" and "back" must give
+  different answers.
+  Good: front = "What technique uses θ = (XᵀX)⁻¹Xᵀy?",
+        back  = "What is the closed-form solution for linear regression?"
+        front answer = normal equation / linear regression; back answer = the formula ✓
+  Bad:  front = "Toward what potential does the membrane return during repolarization?",
+        back  = "What does the membrane potential return toward during the repolarization phase?"
+        → both answers = EK / -90 mV — paraphrase, not a reversal ✗
 - **definition** cards: a term on the front, its definition on the back.
 
 Prioritise the most important concepts, relationships, and facts.
@@ -574,31 +650,81 @@ def _format_concept_list(
     return "\n".join(lines)
 
 
+def chunk_concepts(
+    concepts: list[str],
+    reversed_concepts: set[str] | None,
+    chunk_size: int,
+) -> list[tuple[list[str], set[str] | None]]:
+    """Split *concepts* into sequential batches of *chunk_size*.
+
+    Each batch is paired with the subset of *reversed_concepts* that belongs
+    to it, so every chunk is self-contained and the caller never needs to
+    filter the reversed set itself.
+
+    Returns a list of ``(concept_chunk, reversed_chunk)`` tuples preserving
+    the original concept order.  When *concepts* is empty the result is empty.
+    """
+    if not concepts:
+        return []
+    chunks: list[tuple[list[str], set[str] | None]] = []
+    for i in range(0, len(concepts), chunk_size):
+        batch = concepts[i : i + chunk_size]
+        if reversed_concepts:
+            rev_batch: set[str] | None = reversed_concepts & set(batch)
+            rev_batch = rev_batch if rev_batch else None
+        else:
+            rev_batch = None
+        chunks.append((batch, rev_batch))
+    return chunks
+
+
 def generate_cards_from_concepts(
     doc: ParsedDocument,
     concepts: list[str],
     provider: "LLMProvider",
     notes: list[str] | None = None,
     reversed_concepts: set[str] | None = None,
+    chunk_size: int = CHUNK_SIZE,
 ) -> list[Card]:
+    """Phase 2 — generate exactly one card per confirmed concept.
+
+    Concepts are processed in sequential batches of *chunk_size* (default
+    ``CHUNK_SIZE``).  Keeping batches small prevents the model from losing
+    focus on per-card rules (e.g. the reverse-card constraint) when the deck
+    is large.  Each batch receives the *full* source document so the LLM
+    always has complete context, but only needs to juggle a small number of
+    concepts at once.
+
+    When *concepts* fits within a single chunk the call is functionally
+    identical to the previous single-shot behaviour — no extra API calls.
+
+    *notes* is forwarded to every chunk call because notes are typically
+    style instructions that apply globally (e.g. "make everything
+    bidirectional").
+
+    *reversed_concepts* is filtered per chunk so each call only sees the
+    reversed markers that are relevant to its concept subset.
     """
-    Phase 2 — generate exactly one card per confirmed concept.
+    all_cards: list[Card] = []
 
-    The prompt instructs the LLM to produce one card per concept and to choose
-    the best card type (basic vs definition) for each. When no notes are
-    present the output is capped at len(concepts) as a hard safety net; when
-    notes are present the cap is lifted so notes can request extra cards.
+    for batch, batch_reversed in chunk_concepts(
+        concepts, reversed_concepts, chunk_size
+    ):
+        all_cards.extend(
+            generate_cards_for_chunk(doc, batch, provider, notes, batch_reversed)
+        )
 
-    *notes* is an optional list of free-text instructions that the user entered
-    in the confirm TUI (via the 'n' key).  When provided they are injected into
-    the prompt as an "Additional instructions" section so the LLM can apply
-    them while building cards (e.g. "make cards testable forwards and backwards"
-    or "focus only on the equations" or "also add a card for X").
+    return all_cards
 
-    *reversed_concepts* is an optional set of concept strings that the user
-    explicitly marked for reversal in the TUI (via the 'r' / 'R' keys). These
-    are annotated in the prompt so the LLM uses the basic_reversed card type.
-    """
+
+def generate_cards_for_chunk(
+    doc: ParsedDocument,
+    concepts: list[str],
+    provider: "LLMProvider",
+    notes: list[str] | None,
+    reversed_concepts: set[str] | None,
+) -> list[Card]:
+    """Single-chunk Phase 2 call — internal workhorse for generate_cards_from_concepts."""
     concept_list = _format_concept_list(concepts, reversed_concepts)
     num_concepts = len(concepts)
     has_notes = bool(notes)
@@ -631,11 +757,9 @@ def generate_cards_from_concepts(
         content=doc.plain_text,
     )
 
+    _check_context_budget(prompt, provider)
     raw = provider.complete(prompt)
     cards = _parse_cards(_extract_json_array(raw))
-    # When no notes: hard cap at num_concepts as a safety net against
-    # over-generation. When notes are present: lift the cap so the model can
-    # add extra cards requested by the user's instructions.
     if not has_notes:
         cards = cards[:num_concepts]
     return _apply_mathjax(cards)
@@ -664,6 +788,7 @@ def generate_cards(
         content=doc.plain_text,
     )
 
+    _check_context_budget(prompt, provider)
     raw = provider.complete(prompt)
     cards = _parse_cards(_extract_json_array(raw))
     cards = _apply_mathjax(cards)

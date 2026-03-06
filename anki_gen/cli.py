@@ -12,8 +12,11 @@ from dotenv import load_dotenv
 from anki_gen import ankiconnect
 from anki_gen.exporter import export_apkg
 from anki_gen.generator import (
+    CHUNK_SIZE,
+    chunk_concepts,
     extract_concepts,
     generate_cards,
+    generate_cards_for_chunk,
     generate_cards_from_concepts,
 )
 from anki_gen.models import BasicCard, Card, DefinitionCard
@@ -601,15 +604,44 @@ def main() -> None:
                 # --------------------------------------------------------
                 print()
                 try:
-                    cards = _run_with_animation(
-                        "Generating cards",
-                        generate_cards_from_concepts,
-                        doc,
-                        confirmed,
-                        provider,
-                        notes=notes or None,
-                        reversed_concepts=reversed_concepts or None,
-                    )
+                    if args.verbose:
+                        # Per-chunk loop: one animation line per batch so the
+                        # user can see chunk progress and per-chunk context %.
+                        batches = chunk_concepts(
+                            confirmed,
+                            reversed_concepts or None,
+                            CHUNK_SIZE,
+                        )
+                        n = len(batches)
+                        cards = []
+                        for i, (batch, batch_rev) in enumerate(batches, 1):
+                            label = f"[{i}/{n}] Generating cards"
+                            batch_cards = _run_with_animation(
+                                label,
+                                generate_cards_for_chunk,
+                                doc,
+                                batch,
+                                provider,
+                                notes or None,
+                                batch_rev,
+                            )
+                            cards.extend(batch_cards)
+                            if args.verbose:
+                                print(
+                                    f"       chunk {i}/{n}: "
+                                    f"{len(batch_cards)} card(s) "
+                                    f"from {len(batch)} concept(s)"
+                                )
+                    else:
+                        cards = _run_with_animation(
+                            "Generating cards",
+                            generate_cards_from_concepts,
+                            doc,
+                            confirmed,
+                            provider,
+                            notes=notes or None,
+                            reversed_concepts=reversed_concepts or None,
+                        )
                 except Exception as exc:
                     print(
                         f"warning: Card generation failed for {md_path}: {exc}",
