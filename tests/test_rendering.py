@@ -258,3 +258,39 @@ class TestRenderCode:
         inp = "```\na < b\n```"
         out = _render_code(inp)
         assert "&lt;" in out
+
+
+# ---------------------------------------------------------------------------
+# promote_sole_inline_to_display
+# ---------------------------------------------------------------------------
+
+
+from anki_gen.latex import promote_sole_inline_to_display
+
+
+class TestPromoteSoleInlineToDisplay:
+    def test_sole_inline_promoted(self):
+        assert promote_sole_inline_to_display(r"\(\det(A) = 0\)") == r"\[\det(A) = 0\]"
+
+    def test_sole_inline_with_whitespace(self):
+        assert promote_sole_inline_to_display("  \\(x = 1\\)  ") == r"\[x = 1\]"
+
+    def test_inline_in_prose_not_promoted(self):
+        text = r"The answer is \(x = 1\) as shown."
+        assert promote_sole_inline_to_display(text) == text
+
+    def test_display_already_unchanged(self):
+        text = r"\[\det(A) = 0\]"
+        assert promote_sole_inline_to_display(text) == text
+
+    def test_empty_string_unchanged(self):
+        assert promote_sole_inline_to_display("") == ""
+
+    def test_plain_text_unchanged(self):
+        assert promote_sole_inline_to_display("no math here") == "no math here"
+
+    def test_multiline_sole_equation(self):
+        text = "\\(\n  f(x) = x^2\n\\)"
+        result = promote_sole_inline_to_display(text)
+        assert result.startswith(r"\[")
+        assert result.endswith(r"\]")

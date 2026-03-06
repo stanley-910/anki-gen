@@ -22,6 +22,10 @@ _DISPLAY_RE = re.compile(r"\$\$(.*?)\$\$", re.DOTALL)
 # strings that start/end with a second dollar sign.
 _INLINE_RE = re.compile(r"(?<!\$)\$(?!\$)(.*?)(?<!\$)\$(?!\$)", re.DOTALL)
 
+# Matches a field whose entire content is a single \(...\) block (with optional
+# surrounding whitespace).  These should render as display equations.
+_SOLE_INLINE_RE = re.compile(r"^\s*\\\((.*?)\\\)\s*$", re.DOTALL)
+
 
 def convert_latex_to_mathjax(text: str) -> str:
     """
@@ -37,6 +41,19 @@ def convert_latex_to_mathjax(text: str) -> str:
     text = _DISPLAY_RE.sub(lambda m: r"\[" + m.group(1) + r"\]", text)
     # Step 2: inline equations
     text = _INLINE_RE.sub(lambda m: r"\(" + m.group(1) + r"\)", text)
+    return text
+
+
+def promote_sole_inline_to_display(text: str) -> str:
+    """Promote a field whose entire content is a single \\(...\\) to \\[...\\].
+
+    When the model generates a card whose back (or any field) is nothing but
+    one equation, it should render as a display block.  The LLM frequently
+    emits \\(...\\) even in this case; this deterministic pass corrects it.
+    """
+    m = _SOLE_INLINE_RE.match(text)
+    if m:
+        return r"\[" + m.group(1) + r"\]"
     return text
 
 

@@ -6,7 +6,7 @@ import re
 import sys
 from typing import TYPE_CHECKING
 
-from anki_gen.latex import convert_latex_to_mathjax
+from anki_gen.latex import convert_latex_to_mathjax, promote_sole_inline_to_display
 from anki_gen.models import BasicCard, Card, DefinitionCard
 from anki_gen.parser import ParsedDocument, _derive_max_cards
 
@@ -87,11 +87,9 @@ For any mathematical notation use Anki's MathJax format exclusively.
 This output is embedded in JSON, so backslashes MUST be doubled:
   - Inline equations  (was $...$)  : \\\\( equation \\\\)
   - Display equations (was $$...$$): \\\\[ equation \\\\]
-CRITICAL: equations that appeared as $$...$$ in the source MUST use \\\\[...\\\\],
-never \\\\(...\\\\). Using inline delimiters for display equations is WRONG.
-CRITICAL: if an equation is the primary content of a card field, or would
-naturally sit on its own line, use \\\\[...\\\\] even if the source did not
-explicitly mark it as a display equation.
+CRITICAL: use \\\\[...\\\\] whenever: (a) the source had $$...$$, or (b) the
+equation is the primary content of a field or would naturally sit on its own line.
+Never use \\\\(...\\\\) for display equations.
 Do NOT use $...$ or $$...$$ notation.
 Do NOT write \\( or \\[ with a single backslash — JSON requires \\\\( and \\\\[.\
 """
@@ -131,11 +129,20 @@ Optimise every card for spaced-repetition (SRS):
     (and should) preserve that structure as an HTML list:
       <ul><li>first point</li><li>second point</li></ul>
   - Add context only when the source is genuinely ambiguous without it.
-  - CRITICAL: preserve ALL emphasis from the source — bold (**word**) and
-    italic (*word*) MUST be reproduced using the exact same markdown syntax
-    (**…** for bold, *…* for italic). NEVER strip, flatten, or ignore emphasis.
-    If the source bolds a term, the card MUST bold it. If the source italicises
-    a phrase, the card MUST italicise it. Dropping emphasis is a content error.\
+  - CRITICAL: preserve all source emphasis exactly — **bold** stays **bold**, *italic* stays *italic*. Never strip or flatten it.\
+"""
+
+_REVERSED_INSTRUCTION = """\
+Reversed card rule: "front" is the forward question; "back" is the reverse
+question whose answer is the content of "front". Both sides must be standalone
+questions testing different facts — answering "front" and "back" must give
+different answers.
+Good: front = "What technique uses \\\\( \\\\theta = (X^TX)^{-1}X^Ty \\\\)?",
+      back  = "What is the closed-form solution for linear regression?"
+      front answer = normal equation / linear regression; back answer = the formula ✓
+Bad:  front = "Toward what potential does the membrane return during repolarization?",
+      back  = "What does the membrane potential return toward during the repolarization phase?"
+      → both answers = EK / -90 mV — paraphrase, not a reversal ✗\
 """
 
 # ---------------------------------------------------------------------------
@@ -349,16 +356,7 @@ For each concept choose the most appropriate card type:
   reversal exists. If the concept is a bare fact, isolated property, or
   inherently one-directional (e.g. "resting potential is -70 mV"), use "basic"
   instead. A forced reversal that paraphrases the front is worse than no reversal.
-  Reversed card rule: "front" is the forward question; "back" is the reverse
-  question whose answer is the content of "front". Both sides must be standalone
-  questions testing different facts — answering "front" and "back" must give
-  different answers.
-  Good: front = "What technique uses \\\\( \\\\theta = (X^TX)^{{-1}}X^Ty \\\\)?",
-        back  = "What is the closed-form solution for linear regression?"
-        front answer = normal equation / linear regression; back answer = the formula ✓
-  Bad:  front = "Toward what potential does the membrane return during repolarization?",
-        back  = "What does the membrane potential return toward during the repolarization phase?"
-        → both answers = EK / -90 mV — paraphrase, not a reversal ✗
+  {reversed_instruction}
 
 Rules:
 - Exactly one card per concept — do NOT generate multiple cards for the same concept.
@@ -404,16 +402,7 @@ Produce a mix of:
   testable directions (e.g. name↔formula, cause↔effect, term↔mechanism).
   Only use when a valid reversal exists — if the concept is a bare fact or
   inherently one-directional, use "basic" instead.
-  Reversed card rule: "front" is the forward question; "back" is the reverse
-  question whose answer is the content of "front". Both sides must be standalone
-  questions testing different facts — answering "front" and "back" must give
-  different answers.
-  Good: front = "What technique uses θ = (XᵀX)⁻¹Xᵀy?",
-        back  = "What is the closed-form solution for linear regression?"
-        front answer = normal equation / linear regression; back answer = the formula ✓
-  Bad:  front = "Toward what potential does the membrane return during repolarization?",
-        back  = "What does the membrane potential return toward during the repolarization phase?"
-        → both answers = EK / -90 mV — paraphrase, not a reversal ✗
+  {reversed_instruction}
 - **definition** cards: a term on the front, its definition on the back.
 
 Prioritise the most important concepts, relationships, and facts.
@@ -596,8 +585,12 @@ def _apply_mathjax(cards: list[Card]) -> list[Card]:
         if isinstance(card, BasicCard):
             result.append(
                 BasicCard(
-                    front=convert_latex_to_mathjax(card.front),
-                    back=convert_latex_to_mathjax(card.back),
+                    front=promote_sole_inline_to_display(
+                        convert_latex_to_mathjax(card.front)
+                    ),
+                    back=promote_sole_inline_to_display(
+                        convert_latex_to_mathjax(card.back)
+                    ),
                     reversed=card.reversed,
                     tags=card.tags,
                 )
@@ -605,8 +598,12 @@ def _apply_mathjax(cards: list[Card]) -> list[Card]:
         elif isinstance(card, DefinitionCard):
             result.append(
                 DefinitionCard(
-                    term=convert_latex_to_mathjax(card.term),
-                    definition=convert_latex_to_mathjax(card.definition),
+                    term=promote_sole_inline_to_display(
+                        convert_latex_to_mathjax(card.term)
+                    ),
+                    definition=promote_sole_inline_to_display(
+                        convert_latex_to_mathjax(card.definition)
+                    ),
                     tags=card.tags,
                 )
             )
@@ -749,6 +746,7 @@ def generate_cards_for_chunk(
         concept_list=concept_list,
         task_count_instruction=task_count_instruction,
         output_count_instruction=output_count_instruction,
+        reversed_instruction=_REVERSED_INSTRUCTION,
         mathjax_instruction=_MATHJAX_INSTRUCTION,
         code_instruction=_CODE_INSTRUCTION,
         srs_instruction=_SRS_INSTRUCTION,
@@ -781,6 +779,7 @@ def generate_cards(
 
     prompt = _CARDS_DIRECT_TEMPLATE.format(
         max_cards=effective_max,
+        reversed_instruction=_REVERSED_INSTRUCTION,
         mathjax_instruction=_MATHJAX_INSTRUCTION,
         code_instruction=_CODE_INSTRUCTION,
         srs_instruction=_SRS_INSTRUCTION,
