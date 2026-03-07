@@ -4,11 +4,12 @@ import html
 import json
 import re
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from anki_gen.latex import convert_latex_to_mathjax, promote_sole_inline_to_display
 from anki_gen.models import BasicCard, Card, DefinitionCard
-from anki_gen.parser import ParsedDocument, _derive_max_cards
+from anki_gen.parser import ImageRef, ParsedDocument, _derive_max_cards
 
 if TYPE_CHECKING:
     from anki_gen.llm.base import LLMProvider
@@ -81,6 +82,17 @@ def _check_context_budget(prompt: str, provider: "LLMProvider") -> None:
             file=sys.stderr,
         )
 
+
+_IMAGE_INSTRUCTION = """\
+When the source notes reference an image with a marker like
+  [Image: "caption" (filename.ext)]  or  [Image: filename.ext]
+YOU MUST include the image in a card field using an HTML img tag:
+  <img src="filename.ext" alt="caption">
+Use the exact filename (including extension) as the src value — Anki resolves
+filenames directly from its media folder. Place each image in the card whose
+concept is discussed nearest to that image marker in the source. Include ALL
+images from the source notes — do not omit any image marker.\
+"""
 
 _MATHJAX_INSTRUCTION = """\
 For any mathematical notation use Anki's MathJax format exclusively.
@@ -358,6 +370,11 @@ For each concept choose the most appropriate card type:
   instead. A forced reversal that paraphrases the front is worse than no reversal.
   {reversed_instruction}
 
+- {mathjax_instruction}
+- {code_instruction}
+- {srs_instruction}
+- {image_instruction}
+
 Rules:
 - Exactly one card per concept — do NOT generate multiple cards for the same concept.
 - Cover every concept in the list — do not skip any.
@@ -373,6 +390,7 @@ Rules:
 - {mathjax_instruction}
 - {code_instruction}
 - {srs_instruction}
+- {image_instruction}
 {notes_section}## Output format
 Return ONLY a JSON array{output_count_instruction}. No prose before or after.
 Each element is one of:
@@ -416,6 +434,7 @@ empty JSON array: [].
 - {mathjax_instruction}
 - {code_instruction}
 - {srs_instruction}
+- {image_instruction}
 
 ## Output format
 Return ONLY a JSON array. No prose before or after. Each element is one of:
@@ -613,6 +632,172 @@ def _apply_mathjax(cards: list[Card]) -> list[Card]:
 
 
 # ---------------------------------------------------------------------------
+# Image injection post-processor
+# ---------------------------------------------------------------------------
+
+_IMG_SRC_RE = re.compile(r'src=["\']([^"\']+)["\']')
+
+
+def _images_already_placed(cards: list[Card]) -> set[str]:
+    """Return the set of image filenames already referenced in any card field."""
+    placed: set[str] = set()
+    for card in cards:
+        if isinstance(card, BasicCard):
+            fields = [card.front, card.back]
+        elif isinstance(card, DefinitionCard):
+            fields = [card.term, card.definition]
+        else:
+            continue
+        for f in fields:
+            for m in _IMG_SRC_RE.finditer(f):
+                placed.add(m.group(1))
+    return placed
+
+
+def _best_card_for_image(ref: ImageRef, cards: list[Card], plain_text: str) -> int:
+    """Return the index of the card most contextually relevant to *ref*.
+
+    Score = (window overlap) + 2 × (filename overlap).
+
+    The filename bonus is weighted 2× because it is a direct authorial signal
+    about the image's subject (e.g. "derivative-log-fun.webp" strongly implies
+    the image belongs with the "Derivative of logistic function" card even when
+    the surrounding text happens to discuss other topics).
+
+    Falls back to index 0 if the filename is not found in *plain_text*.
+    """
+    _STOPWORDS = {"a", "an", "the", "of", "in", "is", "and", "or", "to", "for", "fun"}
+
+    marker_pos = plain_text.find(ref.filename)
+    if marker_pos == -1:
+        return 0
+
+    start = max(0, marker_pos - 300)
+    end = min(len(plain_text), marker_pos + 300)
+    window = plain_text[start:end].lower()
+    window_words = set(re.findall(r"\w+", window))
+
+    # Words encoded in the filename (split on hyphens, underscores, dots)
+    stem = Path(ref.filename).stem  # drop extension
+    filename_words = set(re.findall(r"\w+", stem.lower())) - _STOPWORDS
+
+    best_idx = 0
+    best_score = -1
+    for i, card in enumerate(cards):
+        if isinstance(card, BasicCard):
+            raw = card.front + " " + card.back
+        elif isinstance(card, DefinitionCard):
+            raw = card.term + " " + card.definition
+        else:
+            continue
+        # Strip HTML tags before tokenising
+        text = re.sub(r"<[^>]+>", " ", raw).lower()
+        card_words = set(re.findall(r"\w+", text))
+        score = len(card_words & window_words) + 4 * len(card_words & filename_words)
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    return best_idx
+
+
+def _image_near_any_concept(
+    ref: ImageRef, plain_text: str, confirmed_concepts: list[str]
+) -> bool:
+    """Return True if the image marker's context window overlaps with any confirmed concept.
+
+    Tokenises the 600-char window around the image marker and checks for at
+    least one shared word with any confirmed concept name (excluding stopwords).
+    """
+    _STOPWORDS = {"a", "an", "the", "of", "in", "is", "are", "and", "or", "to", "for"}
+
+    marker_pos = plain_text.find(ref.filename)
+    if marker_pos == -1:
+        # No marker found — don't block injection; let caller decide.
+        return True
+
+    start = max(0, marker_pos - 300)
+    end = min(len(plain_text), marker_pos + 300)
+    window_words = set(re.findall(r"\w+", plain_text[start:end].lower())) - _STOPWORDS
+
+    for concept in confirmed_concepts:
+        concept_words = set(re.findall(r"\w+", concept.lower())) - _STOPWORDS
+        if concept_words & window_words:
+            return True
+    return False
+
+
+def inject_missed_images(
+    cards: list[Card],
+    doc: ParsedDocument,
+    confirmed_concepts: list[str] | None = None,
+) -> list[Card]:
+    """Ensure every image in *doc* appears in at least one generated card.
+
+    For each :class:`~anki_gen.parser.ImageRef` whose filename is not already
+    referenced by a ``src`` attribute in any card field, finds the most
+    contextually relevant card via text proximity in ``doc.plain_text`` and
+    appends ``<img src="filename" alt="alt_text">`` to its ``back`` /
+    ``definition`` field.
+
+    When *confirmed_concepts* is provided (``--confirm`` path), an image is
+    only injected if its context window in ``doc.plain_text`` shares at least
+    one word with a confirmed concept name.  Images that sit exclusively near
+    rejected concepts are left out — respecting the user's deletion choice.
+
+    This is a deterministic safety net: it fires only for images the LLM
+    omitted despite the prompt instruction.
+    """
+    if not doc.images or not cards:
+        return cards
+
+    placed = _images_already_placed(cards)
+    missed = [ref for ref in doc.images if ref.filename not in placed]
+    if not missed:
+        return cards
+
+    # When the caller supplies confirmed concepts, skip images whose context
+    # window doesn't overlap with any of them (i.e. the image is near a
+    # rejected concept and the user intentionally excluded it).
+    if confirmed_concepts is not None:
+        missed = [
+            ref
+            for ref in missed
+            if _image_near_any_concept(ref, doc.plain_text, confirmed_concepts)
+        ]
+    if not missed:
+        return cards
+
+    result = list(cards)
+    for ref in missed:
+        idx = _best_card_for_image(ref, result, doc.plain_text)
+        card = result[idx]
+
+        alt = html.escape(ref.alt_text) if ref.alt_text else ""
+        img_tag = (
+            f'<img src="{ref.filename}" alt="{alt}">'
+            if alt
+            else f'<img src="{ref.filename}">'
+        )
+
+        if isinstance(card, BasicCard):
+            result[idx] = BasicCard(
+                front=card.front,
+                back=card.back + img_tag,
+                reversed=card.reversed,
+                tags=card.tags,
+            )
+        elif isinstance(card, DefinitionCard):
+            result[idx] = DefinitionCard(
+                term=card.term,
+                definition=card.definition + img_tag,
+                tags=card.tags,
+            )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -750,6 +935,7 @@ def generate_cards_for_chunk(
         mathjax_instruction=_MATHJAX_INSTRUCTION,
         code_instruction=_CODE_INSTRUCTION,
         srs_instruction=_SRS_INSTRUCTION,
+        image_instruction=_IMAGE_INSTRUCTION,
         notes_section=_format_notes_section(notes),
         title=doc.title,
         content=doc.plain_text,
@@ -783,6 +969,7 @@ def generate_cards(
         mathjax_instruction=_MATHJAX_INSTRUCTION,
         code_instruction=_CODE_INSTRUCTION,
         srs_instruction=_SRS_INSTRUCTION,
+        image_instruction=_IMAGE_INSTRUCTION,
         title=doc.title,
         content=doc.plain_text,
     )

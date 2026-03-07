@@ -18,6 +18,7 @@ from anki_gen.generator import (
     generate_cards,
     generate_cards_for_chunk,
     generate_cards_from_concepts,
+    inject_missed_images,
 )
 from anki_gen.models import BasicCard, Card, DefinitionCard
 from anki_gen.parser import ParsedDocument, collect_markdown_files, parse_file
@@ -386,6 +387,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--source-tags",
+        action="store_true",
+        default=False,
+        help=(
+            "Read tags from each file's YAML frontmatter and apply them to "
+            "the cards generated from that file. "
+            "The frontmatter must have a 'tags' key (list or comma-separated "
+            "string). Frontmatter tags are merged with any --tags value."
+        ),
+    )
+
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -525,6 +538,8 @@ def main() -> None:
     # Process each file
     # ------------------------------------------------------------------
     cards_by_deck: dict[str, list[Card]] = {}
+    all_media: list[Path] = []
+    _seen_media: set[Path] = set()
 
     try:
         for idx, md_path in enumerate(md_files, 1):
@@ -541,7 +556,23 @@ def main() -> None:
                 )
                 continue
 
+            # Collect resolved image paths for media bundling.
+            for ref in doc.images:
+                if ref.resolved_path is None:
+                    print(
+                        f"warning: image '{ref.filename}' referenced in"
+                        f" {md_path.name} could not be found — it will not"
+                        " be bundled.",
+                        file=sys.stderr,
+                    )
+                elif ref.resolved_path not in _seen_media:
+                    _seen_media.add(ref.resolved_path)
+                    all_media.append(ref.resolved_path)
+
             deck_name = args.deck or doc.title
+
+            # Tags for this specific file: global tags + frontmatter tags (if --source-tags).
+            file_tags = global_tags + (doc.source_tags if args.source_tags else [])
 
             if args.confirm:
                 # --------------------------------------------------------
@@ -649,8 +680,11 @@ def main() -> None:
                     )
                     continue
 
-                # Apply per-concept tags and global tags
-                cards = _with_tags(cards, confirmed, concept_tags, global_tags)
+                # Inject images the LLM may have missed.
+                # Pass confirmed concepts so images near rejected concepts are skipped.
+                cards = inject_missed_images(cards, doc, confirmed_concepts=confirmed)
+                # Apply per-concept tags, global tags, and frontmatter tags
+                cards = _with_tags(cards, confirmed, concept_tags, file_tags)
 
             else:
                 # --------------------------------------------------------
@@ -679,9 +713,11 @@ def main() -> None:
                     )
                     continue
 
-                # Apply global tags (no per-concept tags in direct mode)
-                if global_tags:
-                    cards = _with_tags(cards, None, None, global_tags)
+                # Inject images the LLM may have missed
+                cards = inject_missed_images(cards, doc)
+                # Apply global tags and frontmatter tags (no per-concept tags in direct mode)
+                if file_tags:
+                    cards = _with_tags(cards, None, None, file_tags)
 
             _print_summary(deck_name, cards, verbose=args.verbose)
 
@@ -706,6 +742,13 @@ def main() -> None:
     # Deliver: push via AnkiConnect or write .apkg
     # ------------------------------------------------------------------
     if args.push:
+        # Store media files before pushing cards so <img src="..."> tags resolve.
+        if all_media:
+            try:
+                ankiconnect.store_media_files(all_media)
+            except ankiconnect.AnkiConnectError as exc:
+                print(f"warning: Failed to store media files: {exc}", file=sys.stderr)
+
         success = True
         for deck_name, cards in cards_by_deck.items():
             try:
@@ -742,7 +785,7 @@ def main() -> None:
             output_path = Path(stem + ".apkg")
 
         try:
-            export_apkg(cards_by_deck, output_path)
+            export_apkg(cards_by_deck, output_path, media_files=all_media or None)
         except Exception as exc:
             print(f"error: Failed to write .apkg: {exc}", file=sys.stderr)
             sys.exit(1)

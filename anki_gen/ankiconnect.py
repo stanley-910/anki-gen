@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import json
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 from anki_gen.models import BasicCard, Card, DefinitionCard
@@ -129,3 +131,16 @@ def push_cards(deck_name: str, cards: list[Card]) -> tuple[int, list[str]]:
         _invoke("addNotes", notes=addable)
 
     return len(addable), skipped_fronts
+
+
+def store_media_files(media_files: list[Path]) -> None:
+    """
+    Store image/media files in Anki's media collection via AnkiConnect.
+
+    Each file is base64-encoded and uploaded with its basename as the
+    filename so that Anki can resolve ``<img src="filename">`` tags in cards.
+    Existing files with the same name are silently overwritten.
+    """
+    for path in media_files:
+        data = base64.b64encode(path.read_bytes()).decode("utf-8")
+        _invoke("storeMediaFile", filename=path.name, data=data)

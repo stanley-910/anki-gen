@@ -2,10 +2,22 @@ from __future__ import annotations
 
 import re
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from markdown_it import MarkdownIt
+
+
+@dataclass
+class ImageRef:
+    """A single image reference extracted from a Markdown document."""
+
+    filename: str  # basename only, e.g. "diagram.webp"
+    alt_text: str  # caption / alt text, or "" if absent
+    width: int | None  # explicit width in pixels, or None
+    height: int | None  # explicit height in pixels, or None
+    resolved_path: Path | None  # absolute path to the file, or None if not found
 
 
 @dataclass
@@ -16,6 +28,149 @@ class ParsedDocument:
     title: str
     plain_text: str
     concept_count: int
+    images: list[ImageRef] = field(default_factory=list)
+    source_tags: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Image handling
+# ---------------------------------------------------------------------------
+
+# Common Obsidian / Markdown vault attachment folder names, searched in order.
+_IMAGE_SEARCH_DIRS: tuple[str, ...] = (
+    ".",
+    "attachments",
+    "assets",
+    "_resources",
+    "images",
+)
+
+# Obsidian wikilink image: ![[filename|alt|size]]  (pipes and size optional)
+_OBSIDIAN_IMAGE_RE = re.compile(r"!\[\[([^\]\|]+?)(?:\|([^\]\|]*))?(?:\|([^\]]*))?\]\]")
+
+# Standard Markdown image: ![alt](path)
+_STANDARD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)[^)]*\)")
+
+# A string that looks like an Obsidian size spec: "386", "386x14", "x14"
+_SIZE_RE = re.compile(r"^\d*(x\d+)?$")
+
+
+def _is_size_field(s: str) -> bool:
+    """Return True if *s* looks like an Obsidian dimension spec (not alt text)."""
+    s = s.strip()
+    return bool(_SIZE_RE.match(s)) and bool(s)
+
+
+def _parse_obsidian_size(s: str) -> tuple[int | None, int | None]:
+    """Parse "386", "386x14", or "x14" → (width | None, height | None)."""
+    s = s.strip().lower()
+    if "x" in s:
+        left, right = s.split("x", 1)
+        w = int(left) if left.isdigit() else None
+        h = int(right) if right.isdigit() else None
+        return w, h
+    return (int(s) if s.isdigit() else None), None
+
+
+def _resolve_image(filename: str, doc_dir: Path) -> Path | None:
+    """
+    Search for *filename* in the document directory and common attachment
+    subdirectories. Returns the first absolute path found, or None.
+    """
+    for subdir in _IMAGE_SEARCH_DIRS:
+        candidate = (doc_dir / subdir / filename).resolve()
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _image_ref_to_text(ref: ImageRef) -> str:
+    """Render an ImageRef as a plain-text marker for the LLM context."""
+    size_part = ""
+    if ref.width is not None and ref.height is not None:
+        size_part = f", {ref.width}x{ref.height}px"
+    elif ref.width is not None:
+        size_part = f", {ref.width}px wide"
+    if ref.alt_text:
+        return f'[Image: "{ref.alt_text}" ({ref.filename}{size_part})]'
+    return f"[Image: {ref.filename}{size_part}]"
+
+
+def _substitute_images(source: str, doc_dir: Path) -> tuple[str, list[ImageRef]]:
+    """
+    Find all image references in *source* (both Obsidian wikilink and standard
+    Markdown formats), replace each with a plain-text LLM marker, and return
+    the modified source together with a list of ImageRef objects.
+
+    The substitution preserves the in-document position of each reference so
+    the LLM can use proximity to infer which concept each image belongs to.
+    """
+    refs: list[ImageRef] = []
+    replacements: list[tuple[int, int, str]] = []  # (start, end, replacement)
+
+    # --- Obsidian wikilink images: ![[filename|alt|size]] ---
+    for m in _OBSIDIAN_IMAGE_RE.finditer(source):
+        raw_filename = m.group(1).strip()
+        field2 = (m.group(2) or "").strip()
+        field3 = (m.group(3) or "").strip()
+
+        filename = Path(raw_filename).name  # ensure only basename
+
+        # Disambiguate: field2 may be alt text or a size spec (if only 2 fields)
+        if field3:
+            # Three fields: filename | alt | size
+            alt_text = field2
+            w, h = _parse_obsidian_size(field3) if field3 else (None, None)
+        elif field2 and _is_size_field(field2):
+            # Two fields: filename | size (no alt)
+            alt_text = ""
+            w, h = _parse_obsidian_size(field2)
+        else:
+            # Two fields: filename | alt  (or just one field)
+            alt_text = field2
+            w, h = None, None
+
+        resolved = _resolve_image(filename, doc_dir)
+        ref = ImageRef(
+            filename=filename,
+            alt_text=alt_text,
+            width=w,
+            height=h,
+            resolved_path=resolved,
+        )
+        refs.append(ref)
+        replacements.append((m.start(), m.end(), _image_ref_to_text(ref)))
+
+    # --- Standard Markdown images: ![alt](path) ---
+    for m in _STANDARD_IMAGE_RE.finditer(source):
+        # Skip if already covered by an Obsidian match (shouldn't overlap, but guard)
+        start, end = m.start(), m.end()
+        if any(s <= start < e for s, e, _ in replacements):
+            continue
+        alt_text = m.group(1).strip()
+        raw_path = m.group(2).strip()
+        filename = Path(raw_path).name
+        resolved = _resolve_image(filename, doc_dir)
+        ref = ImageRef(
+            filename=filename,
+            alt_text=alt_text,
+            width=None,
+            height=None,
+            resolved_path=resolved,
+        )
+        refs.append(ref)
+        replacements.append((start, end, _image_ref_to_text(ref)))
+
+    if not replacements:
+        return source, refs
+
+    # Apply replacements in reverse order so offsets stay valid
+    replacements.sort(key=lambda x: x[0], reverse=True)
+    result = source
+    for start, end, text in replacements:
+        result = result[:start] + text + result[end:]
+
+    return result, refs
 
 
 def _count_concepts(tokens: list) -> int:
@@ -102,11 +257,73 @@ def _tokens_to_plain_text(tokens: list) -> str:
     return "\n".join(line for line in lines if line.strip())
 
 
+# Matches a YAML frontmatter block at the very start of a file.
+_FRONTMATTER_RE = re.compile(
+    r"^---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|$)", re.DOTALL
+)
+
+
+def _extract_frontmatter_tags(source: str) -> tuple[str, list[str]]:
+    """Strip YAML frontmatter and return (body, tags).
+
+    Supports these frontmatter tag formats:
+        tags: [tag1, tag2]
+        tags:
+          - tag1
+          - tag2
+        tags: tag1, tag2
+
+    Returns (source_without_frontmatter, normalised_tag_list).
+    Tags are lower-cased and spaces replaced with hyphens.
+    If no frontmatter or no tags field, returns (source, []).
+    """
+    m = _FRONTMATTER_RE.match(source)
+    if not m:
+        return source, []
+
+    body = source[m.end() :]
+    yaml_block = m.group(1)
+
+    try:
+        import yaml  # pyyaml — available as transitive dep
+
+        data: Any = yaml.safe_load(yaml_block)
+    except Exception:
+        return body, []
+
+    if not isinstance(data, dict):
+        return body, []
+
+    raw = data.get("tags")
+    if raw is None:
+        return body, []
+
+    # Normalise to list[str]
+    if isinstance(raw, list):
+        tag_list = [str(t) for t in raw]
+    elif isinstance(raw, str):
+        tag_list = [t for t in (t.strip() for t in raw.split(",")) if t]
+    else:
+        tag_list = [str(raw)]
+
+    normalised = [t.strip().replace(" ", "-").lower() for t in tag_list if t.strip()]
+    return body, normalised
+
+
 def parse_file(path: Path) -> ParsedDocument:
     """Parse a single Markdown file into a ParsedDocument."""
     md = MarkdownIt()
-    source = path.read_text(encoding="utf-8")
-    tokens = md.parse(source)
+    raw_source = path.read_text(encoding="utf-8")
+
+    # Strip YAML frontmatter and collect any declared tags.
+    source, source_tags = _extract_frontmatter_tags(raw_source)
+
+    # Replace image syntax with plain-text markers before tokenizing so that
+    # the markers appear at the correct position in plain_text (preserving
+    # proximity information for the LLM).
+    normalized_source, images = _substitute_images(source, path.parent)
+
+    tokens = md.parse(normalized_source)
 
     title = _extract_title(tokens, fallback=path.stem)
     plain_text = _tokens_to_plain_text(tokens)
@@ -117,6 +334,8 @@ def parse_file(path: Path) -> ParsedDocument:
         title=title,
         plain_text=plain_text,
         concept_count=concept_count,
+        images=images,
+        source_tags=source_tags,
     )
 
 

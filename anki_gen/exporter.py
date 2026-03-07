@@ -30,6 +30,12 @@ code {
   font-family: "JetBrains Mono", "Fira Code", Consolas, monospace;
   font-size: 0.875em;
 }
+img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 0.5em auto;
+}
 """
 
 
@@ -159,6 +165,7 @@ def _note_for_card(card: Card, basic_model, definition_model, basic_reversed_mod
 def export_apkg(
     cards_by_deck: dict[str, list[Card]],
     output_path: Path,
+    media_files: list[Path] | None = None,
 ) -> None:
     """
     Write an .apkg file containing one deck per entry in *cards_by_deck*.
@@ -166,6 +173,7 @@ def export_apkg(
     Args:
         cards_by_deck: Mapping of deck name → list of Card objects.
         output_path:   Destination .apkg file path.
+        media_files:   Optional list of image/media file paths to bundle.
     """
     try:
         import genanki
@@ -190,4 +198,6 @@ def export_apkg(
         decks.append(deck)
 
     package = genanki.Package(decks)
+    if media_files:
+        package.media_files = [str(p) for p in media_files]
     package.write_to_file(str(output_path))
