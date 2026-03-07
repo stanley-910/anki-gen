@@ -25,6 +25,7 @@ import sys
 import termios
 import tty
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------------------
 # ANSI helpers
@@ -69,6 +70,9 @@ _C_TAG_INLINE = _fg(75, 195, 195)
 _C_NOTE_NORMAL = _fg(255, 195, 60) + _ITALIC
 _C_NOTE_CURSOR = _fg(255, 255, 255) + _BOLD + _bg(90, 55, 0)
 _C_DIVIDER = _fg(70, 70, 70)
+_C_IMAGE_SELECTED = _fg(80, 215, 135) + _BOLD
+_C_IMAGE_ASSIGNED = _fg(255, 195, 60)
+_C_IMAGE_EXCLUDED = _fg(235, 95, 95) + _DIM
 
 # Reversal symbol (UNO reverse style — left/right arrows)
 _REV_SYMBOL = "⇄"
@@ -183,6 +187,91 @@ class _Item:
         self.tags: list[str] = []
 
 
+@dataclass
+class _ImageDraft:
+    target_concept: str
+    cursor: int = 0
+    assignments: dict[str, set[str]] = field(default_factory=dict)
+    excluded: set[str] = field(default_factory=set)
+
+
+def _copy_image_assignments(
+    image_assignments: dict[str, set[str]],
+) -> dict[str, set[str]]:
+    return {concept: set(filenames) for concept, filenames in image_assignments.items()}
+
+
+def _ordered_unique_image_names(image_names: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in image_names:
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    return ordered
+
+
+def _remove_image_from_assignments(
+    image_assignments: dict[str, set[str]], image_name: str
+) -> None:
+    empty: list[str] = []
+    for concept, assigned in image_assignments.items():
+        assigned.discard(image_name)
+        if not assigned:
+            empty.append(concept)
+    for concept in empty:
+        image_assignments.pop(concept, None)
+
+
+def _toggle_image_for_concept(
+    image_assignments: dict[str, set[str]],
+    excluded_images: set[str],
+    concept: str,
+    image_name: str,
+) -> None:
+    current = image_assignments.get(concept, set())
+    if image_name in current:
+        current.remove(image_name)
+        if current:
+            image_assignments[concept] = current
+        else:
+            image_assignments.pop(concept, None)
+        return
+
+    _remove_image_from_assignments(image_assignments, image_name)
+    excluded_images.discard(image_name)
+    image_assignments.setdefault(concept, set()).add(image_name)
+
+
+def _exclude_image_globally(
+    image_assignments: dict[str, set[str]],
+    excluded_images: set[str],
+    image_name: str,
+) -> None:
+    _remove_image_from_assignments(image_assignments, image_name)
+    excluded_images.add(image_name)
+
+
+def _image_owner(image_assignments: dict[str, set[str]], image_name: str) -> str | None:
+    for concept, assigned in image_assignments.items():
+        if image_name in assigned:
+            return concept
+    return None
+
+
+def _serialize_image_assignments(
+    image_assignments: dict[str, set[str]], image_names: list[str]
+) -> dict[str, list[str]]:
+    order = {name: i for i, name in enumerate(image_names)}
+    result: dict[str, list[str]] = {}
+    for concept, assigned in image_assignments.items():
+        if assigned:
+            result[concept] = sorted(
+                assigned, key=lambda name: order.get(name, len(order))
+            )
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
@@ -285,6 +374,113 @@ def _render_item(
     return result
 
 
+def _render_image_panel(
+    image_names: list[str],
+    draft: _ImageDraft | None,
+    width: int,
+    image_assignments: dict[str, set[str]] | None = None,
+    excluded_images: set[str] | None = None,
+) -> list[str]:
+    target = draft.target_concept if draft is not None else "browse"
+    title = f"{_C_HEADER} Images -> {target}{_R}"
+    hint = (
+        f"{_C_HINT}  Space select   d exclude   Enter save   Esc back{_R}"
+        if draft is not None
+        else f"{_C_HINT}  'i' edit image attribution{_R}"
+    )
+    if not image_names:
+        return [title, f"  {_C_HINT}No scraped images{_R}", hint]
+
+    lines = [title]
+    inner = max(18, width - 4)
+    active_assignments = (
+        draft.assignments if draft is not None else (image_assignments or {})
+    )
+    active_excluded = (
+        draft.excluded if draft is not None else (excluded_images or set())
+    )
+    active_cursor = draft.cursor if draft is not None else -1
+
+    def _clip_suffix(marker_text: str, base_name: str, extra_suffix: str) -> str:
+        plain_prefix = f" {marker_text} {base_name}"
+        available = inner - len(plain_prefix)
+        if available <= 0:
+            return ""
+        if len(extra_suffix) <= available:
+            return extra_suffix
+        if available <= 3:
+            return extra_suffix[:available]
+        return extra_suffix[: available - 3] + "..."
+
+    for i, image_name in enumerate(image_names):
+        selected = draft is not None and image_name in active_assignments.get(
+            target, set()
+        )
+        owner = _image_owner(active_assignments, image_name)
+        excluded = image_name in active_excluded
+        marker = "[x]" if selected else "[ ]"
+        suffix = ""
+        color = ""
+        if excluded:
+            suffix = "  excluded"
+            color = _C_IMAGE_EXCLUDED
+        elif owner and owner != target:
+            full_suffix = f"  -> {owner}"
+            suffix = _clip_suffix(marker, image_name, full_suffix)
+            color = _C_IMAGE_ASSIGNED
+        elif selected:
+            suffix = "  selected"
+            color = _C_IMAGE_SELECTED
+
+        plain = f" {marker} {image_name}{suffix}"
+        clipped = plain[:inner]
+        pad = max(0, inner - len(clipped))
+        if i == active_cursor:
+            lines.append(f"{_C_CURSOR}{clipped}{' ' * pad}{_R}")
+        elif color:
+            lines.append(f" {marker} {color}{image_name}{suffix}{_R}")
+        else:
+            lines.append(f" {marker} {image_name}")
+    lines.append(hint)
+    return lines
+
+
+def _handle_image_menu_key(
+    key: str,
+    image_names: list[str],
+    draft: _ImageDraft,
+) -> str:
+    total_images = len(image_names)
+    if key in ("j", "\x1b[B", "\x1bOB") and total_images > 0:
+        draft.cursor = (draft.cursor + 1) % total_images
+        return "stay"
+    if key in ("k", "\x1b[A", "\x1bOA") and total_images > 0:
+        draft.cursor = (draft.cursor - 1) % total_images
+        return "stay"
+    if key == " " and total_images > 0:
+        _toggle_image_for_concept(
+            draft.assignments,
+            draft.excluded,
+            draft.target_concept,
+            image_names[draft.cursor],
+        )
+        return "stay"
+    if key == "d" and total_images > 0:
+        _exclude_image_globally(
+            draft.assignments,
+            draft.excluded,
+            image_names[draft.cursor],
+        )
+        return "stay"
+    if key in ("\r", "\n"):
+        return "save"
+    if key == "\x1b":
+        return "back"
+    if key in ("q", "\x03"):
+        return "quit"
+    return "stay"
+
+
 def _draw(
     concept_items: list[_Item],
     note_items: list[_Item],
@@ -294,6 +490,10 @@ def _draw(
     edit_pos: int,
     title: str,
     prev_total: int,
+    image_names: list[str] | None = None,
+    image_draft: _ImageDraft | None = None,
+    image_assignments: dict[str, set[str]] | None = None,
+    excluded_images: set[str] | None = None,
 ) -> int:
     """
     Draw the full TUI. Returns the number of lines rendered.
@@ -307,6 +507,9 @@ def _draw(
     nn = len(note_items)
     has_notes = nn > 0
     w = _term_width()
+    has_images = bool(image_names)
+    left_w = max(24, int(w * 0.55)) if has_images else w
+    right_w = max(20, w - left_w - 3) if has_images else 0
 
     kept = sum(1 for it in concept_items if not it.deleted)
     header = f"{_C_HEADER}  Anki Concept Review  ({kept}/{nc} selected){_R}"
@@ -316,23 +519,57 @@ def _draw(
         f"{_C_HINT}  editing — Enter save   Esc cancel{_R}"
         if editing
         else (
-            f"{_C_HINT}  j/k nav   d del   e edit   r rev   R rev-all   t tags   "
-            f"a/n add   Enter confirm   q quit{_R}"
+            f"{_C_HINT}  image mode — Space select   d exclude   Enter save   Esc back{_R}"
+            if image_draft is not None
+            else (
+                f"{_C_HINT}  j/k nav   d del   e edit   r rev   R rev-all   t tags   "
+                f"a/n add   Enter confirm   q quit{_R}"
+            )
         )
     )
 
-    lines: list[str] = [header]
+    left_lines: list[str] = [header]
     for i, item in enumerate(concept_items):
-        lines.append(_render_item(item, i, cursor, edit_mode, edit_buf, edit_pos, w))
+        left_lines.append(
+            _render_item(item, i, cursor, edit_mode, edit_buf, edit_pos, left_w)
+        )
 
     if has_notes:
-        lines.append(f"  {_C_DIVIDER}── notes ──{_R}")
+        left_lines.append(f"  {_C_DIVIDER}── notes ──{_R}")
         for i, item in enumerate(note_items):
-            lines.append(
-                _render_item(item, nc + i, cursor, edit_mode, edit_buf, edit_pos, w)
+            left_lines.append(
+                _render_item(
+                    item,
+                    nc + i,
+                    cursor,
+                    edit_mode,
+                    edit_buf,
+                    edit_pos,
+                    left_w,
+                )
             )
 
-    lines.append(hints)
+    left_lines.append(hints)
+
+    if has_images:
+        right_lines = _render_image_panel(
+            image_names or [],
+            image_draft,
+            right_w,
+            image_assignments=image_assignments,
+            excluded_images=excluded_images,
+        )
+        max_lines = max(len(left_lines), len(right_lines))
+        lines = []
+        divider = f" {_C_DIVIDER}|{_R} "
+        for i in range(max_lines):
+            left = left_lines[i] if i < len(left_lines) else ""
+            right = right_lines[i] if i < len(right_lines) else ""
+            left_vis = _visible_len(left)
+            left_pad = max(0, left_w - left_vis)
+            lines.append(f"{left}{' ' * left_pad}{divider}{right}")
+    else:
+        lines = left_lines
 
     out: list[str] = []
     if prev_total > 0:
@@ -358,15 +595,19 @@ def _erase(total_lines: int) -> None:
 
 
 def review_concepts(
-    title: str, concepts: list[str]
-) -> tuple[list[str], set[str], dict[str, list[str]], list[str]]:
+    title: str, concepts: list[str], image_names: list[str] | None = None
+) -> tuple[
+    list[str], set[str], dict[str, list[str]], list[str], dict[str, list[str]], set[str]
+]:
     """
     Open the inline TUI. Returns (confirmed_concepts, reversed_concepts,
-    concept_tags, notes) where:
+    concept_tags, notes, image_assignments, excluded_images) where:
       - confirmed_concepts: non-deleted concept strings
       - reversed_concepts:  set of confirmed concept strings marked for reversal
       - concept_tags:       dict mapping concept string → per-concept tag list
       - notes:              non-deleted note strings (general instructions for the LLM)
+      - image_assignments:  dict mapping confirmed concept string -> selected image names
+      - excluded_images:    images explicitly marked unused
 
     Raises SystemExit(0) if the user aborts with q / Ctrl-C.
 
@@ -385,11 +626,15 @@ def review_concepts(
     """
     concept_items: list[_Item] = [_Item(c, "concept") for c in concepts]
     note_items: list[_Item] = []
+    image_names = _ordered_unique_image_names(image_names or [])
+    image_assignments: dict[str, set[str]] = {}
+    excluded_images: set[str] = set()
     cursor = 0
     edit_mode = "none"  # "none" | "concept" | "tags"
     edit_buf = ""
     edit_pos = 0
     prev_total = 0
+    image_draft: _ImageDraft | None = None
 
     def _nc() -> int:
         return len(concept_items)
@@ -421,10 +666,44 @@ def review_concepts(
                 edit_pos,
                 title,
                 prev_total,
+                image_names,
+                image_draft,
+                image_assignments,
+                excluded_images,
             )
 
             while result is None:
                 key = _read_key()
+
+                if image_draft is not None:
+                    image_action = _handle_image_menu_key(key, image_names, image_draft)
+                    if image_action == "save":
+                        image_assignments = _copy_image_assignments(
+                            image_draft.assignments
+                        )
+                        excluded_images = set(image_draft.excluded)
+                        image_draft = None
+                    elif image_action == "back":
+                        image_draft = None
+                    elif image_action == "quit":
+                        result = "quit"
+
+                    if result is None:
+                        prev_total = _draw(
+                            concept_items,
+                            note_items,
+                            cursor,
+                            edit_mode,
+                            edit_buf,
+                            edit_pos,
+                            title,
+                            prev_total,
+                            image_names,
+                            image_draft,
+                            image_assignments,
+                            excluded_images,
+                        )
+                    continue
 
                 if edit_mode != "none":
                     items, idx = _item_at(cursor)
@@ -555,6 +834,18 @@ def review_concepts(
                         edit_buf = ""
                         edit_pos = 0
 
+                    elif key == "i":
+                        if tot > 0:
+                            items, idx = _item_at(cursor)
+                            if items is concept_items and not items[idx].deleted:
+                                image_draft = _ImageDraft(
+                                    target_concept=items[idx].text,
+                                    assignments=_copy_image_assignments(
+                                        image_assignments
+                                    ),
+                                    excluded=set(excluded_images),
+                                )
+
                     elif key in ("\r", "\n"):  # confirm
                         result = "confirm"
 
@@ -571,6 +862,10 @@ def review_concepts(
                         edit_pos,
                         title,
                         prev_total,
+                        image_names,
+                        image_draft,
+                        image_assignments,
+                        excluded_images,
                     )
 
     finally:
@@ -589,4 +884,19 @@ def review_concepts(
         it.text: it.tags for it in concept_items if not it.deleted and it.tags
     }
     confirmed_notes = [it.text for it in note_items if not it.deleted]
-    return confirmed_concepts, reversed_concepts, concept_tags, confirmed_notes
+    confirmed_set = set(confirmed_concepts)
+    confirmed_image_assignments = {
+        concept: images
+        for concept, images in _serialize_image_assignments(
+            image_assignments, image_names
+        ).items()
+        if concept in confirmed_set
+    }
+    return (
+        confirmed_concepts,
+        reversed_concepts,
+        concept_tags,
+        confirmed_notes,
+        confirmed_image_assignments,
+        set(excluded_images),
+    )

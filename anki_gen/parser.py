@@ -173,6 +173,13 @@ def _substitute_images(source: str, doc_dir: Path) -> tuple[str, list[ImageRef]]
     return result, refs
 
 
+def _strip_images(source: str) -> str:
+    """Remove Markdown/Obsidian image syntax entirely."""
+    source = _OBSIDIAN_IMAGE_RE.sub("", source)
+    source = _STANDARD_IMAGE_RE.sub("", source)
+    return source
+
+
 def _count_concepts(tokens: list) -> int:
     """
     Heuristically count the number of distinct concepts in a document.
@@ -310,7 +317,7 @@ def _extract_frontmatter_tags(source: str) -> tuple[str, list[str]]:
     return body, normalised
 
 
-def parse_file(path: Path) -> ParsedDocument:
+def parse_file(path: Path, images_enabled: bool = True) -> ParsedDocument:
     """Parse a single Markdown file into a ParsedDocument."""
     md = MarkdownIt()
     raw_source = path.read_text(encoding="utf-8")
@@ -321,7 +328,10 @@ def parse_file(path: Path) -> ParsedDocument:
     # Replace image syntax with plain-text markers before tokenizing so that
     # the markers appear at the correct position in plain_text (preserving
     # proximity information for the LLM).
-    normalized_source, images = _substitute_images(source, path.parent)
+    if images_enabled:
+        normalized_source, images = _substitute_images(source, path.parent)
+    else:
+        normalized_source, images = _strip_images(source), []
 
     tokens = md.parse(normalized_source)
 

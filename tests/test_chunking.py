@@ -166,7 +166,7 @@ class TestGenerateCardsFromConcepts:
         concepts = _concepts(25)
         provider = _provider_returning([concepts[:20], concepts[20:]])
         cards = generate_cards_from_concepts(_doc(), concepts, provider, chunk_size=20)
-        fronts = [c.front for c in cards]
+        fronts = [c.front for c in cards if isinstance(c, BasicCard)]
         assert fronts == concepts
 
     def test_reversed_concepts_scoped_per_chunk(self):
@@ -250,3 +250,17 @@ class TestGenerateCardsFromConcepts:
 
         sig = inspect.signature(generate_cards_from_concepts)
         assert sig.parameters["chunk_size"].default == CHUNK_SIZE
+
+    def test_images_disabled_changes_prompt_instruction(self):
+        concepts = _concepts(2)
+        provider = _provider_returning([concepts])
+        generate_cards_from_concepts(
+            _doc("[Image: fig.png]"),
+            concepts,
+            provider,
+            chunk_size=20,
+            images_enabled=False,
+        )
+        prompt = provider.complete.call_args.args[0]
+        assert "Do not include images." in prompt
+        assert "YOU MUST include the image" not in prompt

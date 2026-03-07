@@ -10,7 +10,7 @@ from anki_gen.generator import (
     _images_already_placed,
     inject_missed_images,
 )
-from anki_gen.models import BasicCard, DefinitionCard
+from anki_gen.models import BasicCard, Card, DefinitionCard
 from anki_gen.parser import ImageRef, ParsedDocument
 
 
@@ -45,6 +45,10 @@ def _basic(front: str = "Q", back: str = "A") -> BasicCard:
 
 def _defn(term: str = "Term", defn: str = "Def") -> DefinitionCard:
     return DefinitionCard(term=term, definition=defn)
+
+
+def _answer(card: Card) -> str:
+    return card.back if isinstance(card, BasicCard) else card.definition
 
 
 # ---------------------------------------------------------------------------
@@ -138,14 +142,14 @@ class TestInjectMissedImages:
         card = _basic(back='A <img src="x.png">')
         doc = _doc(plain_text="x.png", images=[_img("x.png")])
         result = inject_missed_images([card], doc)
-        assert result[0].back.count("<img") == 1
+        assert _answer(result[0]).count("<img") == 1
 
     def test_missed_image_appended_to_basic_back(self):
         card = _basic(front="Q", back="A")
         doc = _doc(plain_text="[Image: chart.png]", images=[_img("chart.png")])
         result = inject_missed_images([card], doc)
         assert isinstance(result[0], BasicCard)
-        assert '<img src="chart.png">' in result[0].back
+        assert '<br><img src="chart.png"><br>' in result[0].back
 
     def test_missed_image_with_alt_text(self):
         card = _basic()
@@ -154,14 +158,20 @@ class TestInjectMissedImages:
             images=[_img("fig.webp", alt="logistic curve")],
         )
         result = inject_missed_images([card], doc)
-        assert 'alt="logistic curve"' in result[0].back
+        assert 'alt="logistic curve"' in _answer(result[0])
 
     def test_missed_image_appended_to_definition_definition(self):
         card = _defn(term="Vanishing gradient", defn="Gradients shrink")
         doc = _doc(plain_text="[Image: grad.png]", images=[_img("grad.png")])
         result = inject_missed_images([card], doc)
         assert isinstance(result[0], DefinitionCard)
-        assert '<img src="grad.png">' in result[0].definition
+        assert '<br><img src="grad.png"><br>' in result[0].definition
+
+    def test_injected_image_wrapped_with_line_breaks(self):
+        card = _basic(front="Q", back="A")
+        doc = _doc(plain_text="[Image: chart.png]", images=[_img("chart.png")])
+        result = inject_missed_images([card], doc)
+        assert _answer(result[0]).endswith('<br><img src="chart.png"><br>')
 
     def test_multiple_missed_images_injected(self):
         cards = [_basic("Q1", "A1"), _basic("Q2", "A2")]
@@ -202,8 +212,8 @@ class TestInjectMissedImages:
             images=[_img("x.png", alt='<script>alert("xss")</script>')],
         )
         result = inject_missed_images([card], doc)
-        assert "<script>" not in result[0].back
-        assert "&lt;script&gt;" in result[0].back
+        assert "<script>" not in _answer(result[0])
+        assert "&lt;script&gt;" in _answer(result[0])
 
     def test_proximity_picks_nearest_card(self):
         # Image marker appears right after text that matches card 0's content
@@ -225,8 +235,60 @@ class TestInjectMissedImages:
         doc = _doc(plain_text=plain_text, images=[_img("saturation.png")])
         result = inject_missed_images(cards, doc)
         # saturation.png is closer to card 0's content
-        assert '<img src="saturation.png">' in result[0].back
-        assert '<img src="saturation.png">' not in result[1].back
+        assert '<img src="saturation.png">' in _answer(result[0])
+        assert '<img src="saturation.png">' not in _answer(result[1])
+
+    def test_manual_assignment_overrides_auto_placement(self):
+        cards = [
+            _basic(front="Logistic?", back="Saturation"),
+            _basic(front="ReLU?", back="Rectified linear unit"),
+        ]
+        doc = _doc(
+            plain_text="logistic saturation [Image: sat.png] relu",
+            images=[_img("sat.png")],
+        )
+        result = inject_missed_images(
+            cards,
+            doc,
+            confirmed_concepts=["Logistic saturation", "ReLU activation"],
+            concept_order=["Logistic saturation", "ReLU activation"],
+            manual_image_assignments={"ReLU activation": ["sat.png"]},
+        )
+        assert '<img src="sat.png">' not in _answer(result[0])
+        assert '<img src="sat.png">' in _answer(result[1])
+
+    def test_excluded_image_not_injected(self):
+        cards = [_basic()]
+        doc = _doc(plain_text="[Image: x.png]", images=[_img("x.png")])
+        result = inject_missed_images(cards, doc, excluded_images={"x.png"})
+        assert '<img src="x.png">' not in _answer(result[0])
+
+    def test_manual_assignment_removes_prior_auto_image(self):
+        cards = [
+            _basic(front="Q1", back='A1 <img src="x.png">'),
+            _basic(front="Q2", back="A2"),
+        ]
+        doc = _doc(plain_text="[Image: x.png]", images=[_img("x.png")])
+        result = inject_missed_images(
+            cards,
+            doc,
+            concept_order=["C1", "C2"],
+            manual_image_assignments={"C2": ["x.png"]},
+        )
+        assert '<img src="x.png">' not in _answer(result[0])
+        assert '<img src="x.png">' in _answer(result[1])
+
+    def test_excluded_image_removed_from_existing_card(self):
+        cards = [_basic(back='A<br><img src="x.png"><br>')]
+        doc = _doc(plain_text="[Image: x.png]", images=[_img("x.png")])
+        result = inject_missed_images(cards, doc, excluded_images={"x.png"})
+        assert '<img src="x.png">' not in _answer(result[0])
+
+    def test_excluding_image_removes_surrounding_breaks(self):
+        cards = [_basic(back='A<br><img src="x.png"><br>B')]
+        doc = _doc(plain_text="[Image: x.png]", images=[_img("x.png")])
+        result = inject_missed_images(cards, doc, excluded_images={"x.png"})
+        assert _answer(result[0]) == "AB"
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +341,7 @@ class TestInjectMissedImagesConceptFilter:
         result = inject_missed_images(
             cards, doc, confirmed_concepts=["Logistic function saturation"]
         )
-        assert '<img src="sat.png">' in result[0].back
+        assert '<img src="sat.png">' in _answer(result[0])
 
     def test_image_near_rejected_concept_not_injected(self):
         # Image is near "logistic saturation" text; confirmed list only has "ReLU activation".
@@ -291,7 +353,7 @@ class TestInjectMissedImagesConceptFilter:
         result = inject_missed_images(
             cards, doc, confirmed_concepts=["ReLU activation"]
         )
-        assert result[0].back == "Avoids saturation"  # no img injected
+        assert _answer(result[0]) == "Avoids saturation"  # no img injected
 
     def test_image_near_rejected_concept_truly_unrelated(self):
         # Image marker is surrounded ONLY by words from a rejected concept.
@@ -302,7 +364,7 @@ class TestInjectMissedImagesConceptFilter:
             cards, doc, confirmed_concepts=["Batch normalization"]
         )
         # "sigmoid", "derivative", "vanishes" have no overlap with "Batch normalization"
-        assert '<img src="deriv.png">' not in result[0].back
+        assert '<img src="deriv.png">' not in _answer(result[0])
 
     def test_no_confirmed_concepts_still_injects(self):
         # confirmed_concepts=None means direct path — inject unconditionally
@@ -310,7 +372,7 @@ class TestInjectMissedImagesConceptFilter:
         cards = [_basic()]
         doc = _doc(plain_text=plain_text, images=[_img("x.png")])
         result = inject_missed_images(cards, doc, confirmed_concepts=None)
-        assert '<img src="x.png">' in result[0].back
+        assert '<img src="x.png">' in _answer(result[0])
 
     def test_empty_confirmed_concepts_list_blocks_all(self):
         # Empty list → no confirmed concepts → no image can match → nothing injected
@@ -318,4 +380,4 @@ class TestInjectMissedImagesConceptFilter:
         cards = [_basic()]
         doc = _doc(plain_text=plain_text, images=[_img("sat.png")])
         result = inject_missed_images(cards, doc, confirmed_concepts=[])
-        assert '<img src="sat.png">' not in result[0].back
+        assert '<img src="sat.png">' not in _answer(result[0])

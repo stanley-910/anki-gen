@@ -325,3 +325,15 @@ class TestParseFileImages:
         md = self._write_md(tmp_path, "# Title\n\nJust text.\n")
         doc = parse_file(md)
         assert doc.images == []
+
+    def test_images_disabled_removes_markers_and_refs(self, tmp_path):
+        md = self._write_md(
+            tmp_path,
+            "# Title\n\nBefore\n\n![[fig.png|Caption]]\n\nAfter\n",
+        )
+        doc = parse_file(md, images_enabled=False)
+        assert doc.images == []
+        assert "[Image:" not in doc.plain_text
+        assert "fig.png" not in doc.plain_text
+        assert "Before" in doc.plain_text
+        assert "After" in doc.plain_text

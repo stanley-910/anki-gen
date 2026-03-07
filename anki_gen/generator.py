@@ -5,7 +5,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 from anki_gen.latex import convert_latex_to_mathjax, promote_sole_inline_to_display
 from anki_gen.models import BasicCard, Card, DefinitionCard
@@ -638,7 +638,67 @@ def _apply_mathjax(cards: list[Card]) -> list[Card]:
 _IMG_SRC_RE = re.compile(r'src=["\']([^"\']+)["\']')
 
 
-def _images_already_placed(cards: list[Card]) -> set[str]:
+def _append_image_to_card(card: Card, img_tag: str) -> Card:
+    wrapped = f"<br>{img_tag}<br>"
+    if isinstance(card, BasicCard):
+        return BasicCard(
+            front=card.front,
+            back=card.back + wrapped,
+            reversed=card.reversed,
+            tags=card.tags,
+        )
+    if isinstance(card, DefinitionCard):
+        return DefinitionCard(
+            term=card.term,
+            definition=card.definition + wrapped,
+            tags=card.tags,
+        )
+    return card
+
+
+def _with_card_fields(card: Card, fields: list[str]) -> Card:
+    if isinstance(card, BasicCard):
+        return BasicCard(
+            front=fields[0],
+            back=fields[1],
+            reversed=card.reversed,
+            tags=card.tags,
+        )
+    if isinstance(card, DefinitionCard):
+        return DefinitionCard(term=fields[0], definition=fields[1], tags=card.tags)
+    return card
+
+
+def _remove_image_from_cards(cards: list[Card], filename: str) -> list[Card]:
+    pattern = re.compile(
+        r'(?:<br>)?\s*<img\b(?=[^>]*\bsrc=["\']%s["\'])[^>]*?/?>\s*(?:<br>)?'
+        % re.escape(filename),
+        re.IGNORECASE,
+    )
+    result: list[Card] = []
+    for card in cards:
+        if isinstance(card, BasicCard):
+            fields = [card.front, card.back]
+        elif isinstance(card, DefinitionCard):
+            fields = [card.term, card.definition]
+        else:
+            result.append(card)
+            continue
+        cleaned = [pattern.sub("", field) for field in fields]
+        result.append(_with_card_fields(card, cleaned))
+    return result
+
+
+def _build_img_tag(ref: ImageRef) -> str:
+    alt = html.escape(ref.alt_text) if ref.alt_text else ""
+    return (
+        f'<img src="{ref.filename}" alt="{alt}">'
+        if alt
+        else f'<img src="{ref.filename}">'
+    )
+
+
+def _images_already_placed(cards: Sequence[Card]) -> set[str]:
     """Return the set of image filenames already referenced in any card field."""
     placed: set[str] = set()
     for card in cards:
@@ -654,7 +714,7 @@ def _images_already_placed(cards: list[Card]) -> set[str]:
     return placed
 
 
-def _best_card_for_image(ref: ImageRef, cards: list[Card], plain_text: str) -> int:
+def _best_card_for_image(ref: ImageRef, cards: Sequence[Card], plain_text: str) -> int:
     """Return the index of the card most contextually relevant to *ref*.
 
     Score = (window overlap) + 2 × (filename overlap).
@@ -728,9 +788,12 @@ def _image_near_any_concept(
 
 
 def inject_missed_images(
-    cards: list[Card],
+    cards: list[Card] | Sequence[Card],
     doc: ParsedDocument,
     confirmed_concepts: list[str] | None = None,
+    concept_order: list[str] | None = None,
+    manual_image_assignments: dict[str, list[str]] | None = None,
+    excluded_images: set[str] | None = None,
 ) -> list[Card]:
     """Ensure every image in *doc* appears in at least one generated card.
 
@@ -749,12 +812,37 @@ def inject_missed_images(
     omitted despite the prompt instruction.
     """
     if not doc.images or not cards:
-        return cards
+        return list(cards)
 
-    placed = _images_already_placed(cards)
-    missed = [ref for ref in doc.images if ref.filename not in placed]
+    refs_by_name = {ref.filename: ref for ref in doc.images}
+    result = list(cards)
+    excluded = set(excluded_images or ())
+
+    if excluded:
+        for filename in excluded:
+            result = _remove_image_from_cards(result, filename)
+
+    if manual_image_assignments:
+        concept_index = {concept: i for i, concept in enumerate(concept_order or [])}
+        for concept, image_names in manual_image_assignments.items():
+            idx = concept_index.get(concept)
+            if idx is None or idx >= len(result):
+                continue
+            for image_name in image_names:
+                ref = refs_by_name.get(image_name)
+                if ref is None:
+                    continue
+                result = _remove_image_from_cards(result, image_name)
+                result[idx] = _append_image_to_card(result[idx], _build_img_tag(ref))
+
+    placed = _images_already_placed(result)
+    missed = [
+        ref
+        for ref in doc.images
+        if ref.filename not in placed and ref.filename not in excluded
+    ]
     if not missed:
-        return cards
+        return result
 
     # When the caller supplies confirmed concepts, skip images whose context
     # window doesn't overlap with any of them (i.e. the image is near a
@@ -766,33 +854,11 @@ def inject_missed_images(
             if _image_near_any_concept(ref, doc.plain_text, confirmed_concepts)
         ]
     if not missed:
-        return cards
+        return result
 
-    result = list(cards)
     for ref in missed:
         idx = _best_card_for_image(ref, result, doc.plain_text)
-        card = result[idx]
-
-        alt = html.escape(ref.alt_text) if ref.alt_text else ""
-        img_tag = (
-            f'<img src="{ref.filename}" alt="{alt}">'
-            if alt
-            else f'<img src="{ref.filename}">'
-        )
-
-        if isinstance(card, BasicCard):
-            result[idx] = BasicCard(
-                front=card.front,
-                back=card.back + img_tag,
-                reversed=card.reversed,
-                tags=card.tags,
-            )
-        elif isinstance(card, DefinitionCard):
-            result[idx] = DefinitionCard(
-                term=card.term,
-                definition=card.definition + img_tag,
-                tags=card.tags,
-            )
+        result[idx] = _append_image_to_card(result[idx], _build_img_tag(ref))
 
     return result
 
@@ -867,6 +933,7 @@ def generate_cards_from_concepts(
     notes: list[str] | None = None,
     reversed_concepts: set[str] | None = None,
     chunk_size: int = CHUNK_SIZE,
+    images_enabled: bool = True,
 ) -> list[Card]:
     """Phase 2 — generate exactly one card per confirmed concept.
 
@@ -893,7 +960,14 @@ def generate_cards_from_concepts(
         concepts, reversed_concepts, chunk_size
     ):
         all_cards.extend(
-            generate_cards_for_chunk(doc, batch, provider, notes, batch_reversed)
+            generate_cards_for_chunk(
+                doc,
+                batch,
+                provider,
+                notes,
+                batch_reversed,
+                images_enabled=images_enabled,
+            )
         )
 
     return all_cards
@@ -905,6 +979,7 @@ def generate_cards_for_chunk(
     provider: "LLMProvider",
     notes: list[str] | None,
     reversed_concepts: set[str] | None,
+    images_enabled: bool = True,
 ) -> list[Card]:
     """Single-chunk Phase 2 call — internal workhorse for generate_cards_from_concepts."""
     concept_list = _format_concept_list(concepts, reversed_concepts)
@@ -935,7 +1010,9 @@ def generate_cards_for_chunk(
         mathjax_instruction=_MATHJAX_INSTRUCTION,
         code_instruction=_CODE_INSTRUCTION,
         srs_instruction=_SRS_INSTRUCTION,
-        image_instruction=_IMAGE_INSTRUCTION,
+        image_instruction=_IMAGE_INSTRUCTION
+        if images_enabled
+        else "Do not include images.",
         notes_section=_format_notes_section(notes),
         title=doc.title,
         content=doc.plain_text,
@@ -953,6 +1030,7 @@ def generate_cards(
     doc: ParsedDocument,
     provider: "LLMProvider",
     max_cards: int | None = None,
+    images_enabled: bool = True,
 ) -> list[Card]:
     """
     Single-call path (no --confirm). Generates cards directly from the document.
@@ -969,7 +1047,9 @@ def generate_cards(
         mathjax_instruction=_MATHJAX_INSTRUCTION,
         code_instruction=_CODE_INSTRUCTION,
         srs_instruction=_SRS_INSTRUCTION,
-        image_instruction=_IMAGE_INSTRUCTION,
+        image_instruction=_IMAGE_INSTRUCTION
+        if images_enabled
+        else "Do not include images.",
         title=doc.title,
         content=doc.plain_text,
     )

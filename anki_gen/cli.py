@@ -264,7 +264,7 @@ def _run_with_animation(message: str, fn, *args, **kwargs):
 # ---------------------------------------------------------------------------
 
 # Short flags that are boolean (store_true) — can be combined as -vcp etc.
-_BOOL_SHORTS = frozenset("vcp")
+_BOOL_SHORTS = frozenset("vcpi")
 
 
 def _expand_argv(argv: list[str]) -> list[str]:
@@ -395,6 +395,18 @@ def _build_parser() -> argparse.ArgumentParser:
             "the cards generated from that file. "
             "The frontmatter must have a 'tags' key (list or comma-separated "
             "string). Frontmatter tags are merged with any --tags value."
+        ),
+    )
+
+    parser.add_argument(
+        "--no-images",
+        "-i",
+        dest="images",
+        action="store_false",
+        default=True,
+        help=(
+            "Disable image parsing, image-aware prompting, media bundling, and "
+            "image attribution. Images are enabled by default."
         ),
     )
 
@@ -544,7 +556,7 @@ def main() -> None:
     try:
         for idx, md_path in enumerate(md_files, 1):
             try:
-                doc: ParsedDocument = parse_file(md_path)
+                doc: ParsedDocument = parse_file(md_path, images_enabled=args.images)
             except Exception as exc:
                 print(f"warning: Failed to parse {md_path}: {exc}", file=sys.stderr)
                 continue
@@ -605,9 +617,18 @@ def main() -> None:
                 from anki_gen.confirm import review_concepts  # lazy import (needs TTY)
 
                 print()
+                image_assignments: dict[str, list[str]] = {}
+                excluded_images: set[str] = set()
                 try:
-                    confirmed, reversed_concepts, concept_tags, notes = review_concepts(
-                        doc.title, concepts
+                    (
+                        confirmed,
+                        reversed_concepts,
+                        concept_tags,
+                        notes,
+                        image_assignments,
+                        excluded_images,
+                    ) = review_concepts(
+                        doc.title, concepts, [ref.filename for ref in doc.images]
                     )
                 except SystemExit:
                     print("Aborted.")
@@ -629,6 +650,14 @@ def main() -> None:
                     print(f"  Notes ({len(notes)}):")
                     for note in notes:
                         print(f"       • {note}")
+
+                if image_assignments and args.verbose:
+                    print("  Manual image assignments:")
+                    for concept, image_names in image_assignments.items():
+                        print(f"       • {concept}: {', '.join(image_names)}")
+
+                if excluded_images and args.verbose:
+                    print(f"  Excluded images: {', '.join(sorted(excluded_images))}")
 
                 # --------------------------------------------------------
                 # Phase 2: generate from confirmed concepts
@@ -655,6 +684,7 @@ def main() -> None:
                                 provider,
                                 notes or None,
                                 batch_rev,
+                                images_enabled=args.images,
                             )
                             cards.extend(batch_cards)
                             if args.verbose:
@@ -672,6 +702,7 @@ def main() -> None:
                             provider,
                             notes=notes or None,
                             reversed_concepts=reversed_concepts or None,
+                            images_enabled=args.images,
                         )
                 except Exception as exc:
                     print(
@@ -682,7 +713,15 @@ def main() -> None:
 
                 # Inject images the LLM may have missed.
                 # Pass confirmed concepts so images near rejected concepts are skipped.
-                cards = inject_missed_images(cards, doc, confirmed_concepts=confirmed)
+                if args.images:
+                    cards = inject_missed_images(
+                        cards,
+                        doc,
+                        confirmed_concepts=confirmed,
+                        concept_order=confirmed,
+                        manual_image_assignments=image_assignments,
+                        excluded_images=excluded_images,
+                    )
                 # Apply per-concept tags, global tags, and frontmatter tags
                 cards = _with_tags(cards, confirmed, concept_tags, file_tags)
 
@@ -705,6 +744,7 @@ def main() -> None:
                         doc,
                         provider,
                         max_cards=args.max_cards,
+                        images_enabled=args.images,
                     )
                 except Exception as exc:
                     print(
@@ -714,7 +754,8 @@ def main() -> None:
                     continue
 
                 # Inject images the LLM may have missed
-                cards = inject_missed_images(cards, doc)
+                if args.images:
+                    cards = inject_missed_images(cards, doc)
                 # Apply global tags and frontmatter tags (no per-concept tags in direct mode)
                 if file_tags:
                     cards = _with_tags(cards, None, None, file_tags)
